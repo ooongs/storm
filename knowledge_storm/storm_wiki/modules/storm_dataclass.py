@@ -114,11 +114,16 @@ class StormInformationTable(InformationTable):
             for snippet in information.snippets:
                 self.collected_urls.append(url)
                 self.collected_snippets.append(snippet)
+        if not self.collected_snippets:
+            self.encoded_snippets = []
+            return
         self.encoded_snippets = self.encoder.encode(self.collected_snippets)
 
     def retrieve_information(
         self, queries: Union[List[str], str], search_top_k
     ) -> List[Information]:
+        if not getattr(self, "collected_snippets", None):
+            return []
         selected_urls = []
         selected_snippets = []
         if type(queries) is str:

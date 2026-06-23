@@ -26,6 +26,25 @@ We host a number of example scripts for various customization of STORM (e.g., us
 
 Besides VLLM server, STORM is also compatible with [TGI](https://huggingface.co/docs/text-generation-inference/en/index) server or [Together.ai](https://www.together.ai/products#inference) endpoint. 
 
+## Run STORM with Qwen
+
+[run_storm_wiki_qwen.py](run_storm_wiki_qwen.py) uses Alibaba Cloud Model Studio's OpenAI-compatible API. By default, it combines `qwen3.6-flash` for conversation/question asking with `qwen3.7-plus` for outline generation, article generation, and polishing.
+
+Set `DASHSCOPE_API_KEY` and optionally `DASHSCOPE_API_BASE` in `.env`, `secrets.toml`, or your shell. The default base URL is the China endpoint `https://dashscope.aliyuncs.com/compatible-mode/v1`.
+
+```
+python examples/storm_examples/run_storm_wiki_qwen.py \
+    --output-dir $OUTPUT_DIR \
+    --retriever you \
+    --cache-mode implicit \
+    --do-research \
+    --do-generate-outline \
+    --do-generate-article \
+    --do-polish-article
+```
+
+Use `--cache-mode explicit` to add official `cache_control` markers. This can reduce provider-side token cost when prompts share long stable prefixes, but cache creation itself costs extra, so keep `implicit` for exploratory runs.
+
 
 ## Run STORM with your own corpus
 

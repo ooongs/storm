@@ -268,6 +268,135 @@ class LitellmModel(LM):
         return outputs
 
 
+QWEN_DEFAULT_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+
+def _strip_litellm_provider_prefix(model: str) -> str:
+    return model.split("/", 1)[1] if "/" in model else model
+
+
+def _make_qwen_openai_compatible_model_name(model: str) -> str:
+    model_name = _strip_litellm_provider_prefix(model)
+    return model if model.startswith("openai/") else f"openai/{model_name}"
+
+
+def _message_has_cache_control(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict) and "cache_control" in block for block in content
+        )
+    return False
+
+
+def _add_qwen_cache_control(
+    messages: list[dict[str, Any]], cache_prefix_chars: Optional[int] = None
+) -> list[dict[str, Any]]:
+    """Return a copy of messages with one DashScope explicit cache marker.
+
+    DashScope's explicit context cache is OpenAI-compatible and uses
+    content blocks with cache_control. LiteLLM's dashscope provider flattens
+    content blocks, so QwenModel routes through the OpenAI-compatible provider.
+    """
+
+    copied_messages = [dict(message) for message in messages]
+    if any(_message_has_cache_control(message) for message in copied_messages):
+        return copied_messages
+
+    for message in copied_messages:
+        content = message.get("content")
+        if not content:
+            continue
+
+        if isinstance(content, str):
+            if cache_prefix_chars and 0 < cache_prefix_chars < len(content):
+                message["content"] = [
+                    {
+                        "type": "text",
+                        "text": content[:cache_prefix_chars],
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {"type": "text", "text": content[cache_prefix_chars:]},
+                ]
+            else:
+                message["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            break
+
+        if isinstance(content, list):
+            copied_blocks = [
+                dict(block) if isinstance(block, dict) else block for block in content
+            ]
+            for block in copied_blocks:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    block["cache_control"] = {"type": "ephemeral"}
+                    message["content"] = copied_blocks
+                    return copied_messages
+
+    return copied_messages
+
+
+class QwenModel(LitellmModel):
+    """Qwen chat model wrapper for Alibaba Cloud Model Studio/DashScope.
+
+    The wrapper uses the official OpenAI-compatible endpoint so that explicit
+    context cache markers can be passed through without LiteLLM flattening them.
+    Local LiteLLM disk cache remains available through the inherited cache flag.
+    """
+
+    def __init__(
+        self,
+        model: str = "qwen3.7-plus",
+        api_key: Optional[str] = None,
+        api_base: Optional[str] = None,
+        model_type: Literal["chat", "text"] = "chat",
+        provider_cache: bool = False,
+        cache_prefix_chars: Optional[int] = None,
+        **kwargs,
+    ):
+        self.qwen_model = _strip_litellm_provider_prefix(model)
+        self.provider_cache = provider_cache
+        self.cache_prefix_chars = cache_prefix_chars
+        api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
+        api_base = api_base or os.getenv("DASHSCOPE_API_BASE", QWEN_DEFAULT_API_BASE)
+        if not api_key:
+            raise ValueError(
+                "QwenModel requires DASHSCOPE_API_KEY or an explicit api_key."
+            )
+
+        super().__init__(
+            model=_make_qwen_openai_compatible_model_name(model),
+            api_key=api_key,
+            api_base=api_base,
+            model_type=model_type,
+            **kwargs,
+        )
+
+    def get_usage_and_reset(self):
+        usage = {
+            self.qwen_model: {
+                "prompt_tokens": self.prompt_tokens,
+                "completion_tokens": self.completion_tokens,
+            }
+        }
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        return usage
+
+    def __call__(self, prompt=None, messages=None, **kwargs):
+        provider_cache = kwargs.pop("provider_cache", self.provider_cache)
+        cache_prefix_chars = kwargs.pop("cache_prefix_chars", self.cache_prefix_chars)
+        if provider_cache:
+            messages = messages or [{"role": "user", "content": prompt}]
+            messages = _add_qwen_cache_control(messages, cache_prefix_chars)
+        return super().__call__(prompt=prompt, messages=messages, **kwargs)
+
+
 # ========================================================================
 # The following language model classes were deprecated after v1.1.0.
 # They remain in this file for backward compatibility but will no longer be maintained.

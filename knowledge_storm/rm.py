@@ -411,6 +411,7 @@ class SerperRM(dspy.Retrieve):
         serper_search_api_key=None,
         k=3,
         query_params=None,
+        is_valid_source: Callable = None,
         ENABLE_EXTRA_SNIPPET_EXTRACTION=False,
         min_char_count: int = 150,
         snippet_chunk_size: int = 1000,
@@ -436,6 +437,9 @@ class SerperRM(dspy.Retrieve):
         """
         super().__init__(k=k)
         self.usage = 0
+        self.raw_result_count = 0
+        self.filtered_by_source_count = 0
+        self.filtered_by_exclude_count = 0
         self.query_params = None
         self.ENABLE_EXTRA_SNIPPET_EXTRACTION = ENABLE_EXTRA_SNIPPET_EXTRACTION
         self.webpage_helper = WebPageHelper(
@@ -443,6 +447,10 @@ class SerperRM(dspy.Retrieve):
             snippet_chunk_size=snippet_chunk_size,
             max_thread_num=webpage_helper_max_threads,
         )
+        if is_valid_source:
+            self.is_valid_source = is_valid_source
+        else:
+            self.is_valid_source = lambda x: True
 
         if query_params is None:
             self.query_params = {"num": k, "autocorrect": True, "page": 1}
@@ -511,7 +519,7 @@ class SerperRM(dspy.Retrieve):
         for query in queries:
             if query == "Queries:":
                 continue
-            query_params = self.query_params
+            query_params = dict(self.query_params)
 
             # All available parameters can be found in the playground: https://serper.dev/playground
             # Sets the json value for query to be the query that is being parsed.
@@ -532,6 +540,12 @@ class SerperRM(dspy.Retrieve):
                 organic_results = result.get("organic", [])
                 for organic in organic_results:
                     url = organic.get("link")
+                    if not url:
+                        continue
+                    if url in exclude_urls:
+                        continue
+                    if not self.is_valid_source(url):
+                        continue
                     if url:
                         urls.append(url)
             valid_url_to_snippets = self.webpage_helper.urls_to_snippets(urls)
@@ -544,6 +558,14 @@ class SerperRM(dspy.Retrieve):
                 organic_results = result.get("organic")
                 knowledge_graph = result.get("knowledgeGraph")
                 for organic in organic_results:
+                    url = organic.get("link")
+                    self.raw_result_count += 1
+                    if not url or url in exclude_urls:
+                        self.filtered_by_exclude_count += 1
+                        continue
+                    if not self.is_valid_source(url):
+                        self.filtered_by_source_count += 1
+                        continue
                     snippets = [organic.get("snippet")]
                     if self.ENABLE_EXTRA_SNIPPET_EXTRACTION:
                         snippets.extend(
@@ -553,7 +575,7 @@ class SerperRM(dspy.Retrieve):
                         {
                             "snippets": snippets,
                             "title": organic.get("title"),
-                            "url": organic.get("link"),
+                            "url": url,
                             "description": (
                                 knowledge_graph.get("description")
                                 if knowledge_graph is not None

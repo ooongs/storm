@@ -473,9 +473,19 @@ class LMConfigs(ABC):
         return model_name_to_usage
 
     def log(self):
+        def redact_secrets(kwargs):
+            redacted = {}
+            for key, value in kwargs.items():
+                normalized_key = key.lower()
+                if "api_key" in normalized_key or normalized_key.endswith("_key"):
+                    redacted[key] = "<redacted>"
+                else:
+                    redacted[key] = value
+            return redacted
+
         return OrderedDict(
             {
-                attr_name: getattr(self, attr_name).kwargs
+                attr_name: redact_secrets(getattr(self, attr_name).kwargs)
                 for attr_name in self.__dict__
                 if "_lm" in attr_name and hasattr(getattr(self, attr_name), "kwargs")
             }

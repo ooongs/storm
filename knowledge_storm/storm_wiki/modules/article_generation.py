@@ -2,7 +2,7 @@ import concurrent.futures
 import copy
 import logging
 from concurrent.futures import as_completed
-from typing import List, Union
+from typing import Dict, List, Union
 
 import dspy
 
@@ -29,6 +29,14 @@ class StormArticleGenerationModule(ArticleGenerationModule):
         self.article_gen_lm = article_gen_lm
         self.max_thread_num = max_thread_num
         self.section_gen = ConvToSection(engine=self.article_gen_lm)
+        self.section_context_by_name: Dict[str, str] = {}
+        self.skip_introduction_and_conclusion = True
+
+    def set_section_contexts(self, section_context_by_name: Dict[str, str]):
+        self.section_context_by_name = section_context_by_name or {}
+
+    def set_skip_introduction_and_conclusion(self, value: bool):
+        self.skip_introduction_and_conclusion = value
 
     def generate_section(
         self, topic, section_name, information_table, section_outline, section_query
@@ -43,6 +51,7 @@ class StormArticleGenerationModule(ArticleGenerationModule):
             outline=section_outline,
             section=section_name,
             collected_info=collected_info,
+            section_context=self.section_context_by_name.get(section_name, ""),
         )
         return {
             "section_name": section_name,
@@ -94,12 +103,16 @@ class StormArticleGenerationModule(ArticleGenerationModule):
                 future_to_sec_title = {}
                 for section_title in sections_to_write:
                     # We don't want to write a separate introduction section.
-                    if section_title.lower().strip() == "introduction":
+                    if (
+                        self.skip_introduction_and_conclusion
+                        and section_title.lower().strip() == "introduction"
+                    ):
                         continue
                         # We don't want to write a separate conclusion section.
-                    if section_title.lower().strip().startswith(
-                        "conclusion"
-                    ) or section_title.lower().strip().startswith("summary"):
+                    if self.skip_introduction_and_conclusion and (
+                        section_title.lower().strip().startswith("conclusion")
+                        or section_title.lower().strip().startswith("summary")
+                    ):
                         continue
                     section_query = article_with_outline.get_outline_as_list(
                         root_section_name=section_title, add_hashtags=False
@@ -142,7 +155,12 @@ class ConvToSection(dspy.Module):
         self.engine = engine
 
     def forward(
-        self, topic: str, outline: str, section: str, collected_info: List[Information]
+        self,
+        topic: str,
+        outline: str,
+        section: str,
+        collected_info: List[Information],
+        section_context: str = "",
     ):
         info = ""
         for idx, storm_info in enumerate(collected_info):
@@ -153,24 +171,35 @@ class ConvToSection(dspy.Module):
 
         with dspy.settings.context(lm=self.engine):
             section = ArticleTextProcessing.clean_up_section(
-                self.write_section(topic=topic, info=info, section=section).output
+                self.write_section(
+                    topic=topic,
+                    info=info,
+                    outline=outline,
+                    section=section,
+                    section_context=section_context,
+                ).output
             )
 
         return dspy.Prediction(section=section)
 
 
 class WriteSection(dspy.Signature):
-    """Write a Wikipedia section based on the collected information.
+    """Write a source-grounded section based on the collected information and requested writing context.
 
     Here is the format of your writing:
-        1. Use "#" Title" to indicate section title, "##" Title" to indicate subsection title, "###" Title" to indicate subsubsection title, and so on.
+        1. Use Markdown headings that match the requested outline.
         2. Use [1], [2], ..., [n] in line (for example, "The capital of the United States is Washington, D.C.[1][3]."). You DO NOT need to include a References or Sources section to list the sources at the end.
+        3. If a writing context is provided, follow its audience, structure, coverage, and length requirements.
     """
 
     info = dspy.InputField(prefix="The collected information:\n", format=str)
     topic = dspy.InputField(prefix="The topic of the page: ", format=str)
+    outline = dspy.InputField(prefix="Requested outline for this section:\n", format=str)
     section = dspy.InputField(prefix="The section you need to write: ", format=str)
+    section_context = dspy.InputField(
+        prefix="Additional writing context and requirements:\n", format=str
+    )
     output = dspy.OutputField(
-        prefix="Write the section with proper inline citations (Start your writing with # section title. Don't include the page title or try to write other sections):\n",
+        prefix="Write the section with proper inline citations. Start with the requested section heading, do not include the page title, and do not write unrelated sections:\n",
         format=str,
     )

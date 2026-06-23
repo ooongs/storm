@@ -23,7 +23,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 
 
 class ConvSimulator(dspy.Module):
-    """Simulate a conversation between a Wikipedia writer with specific persona and an expert."""
+    """Simulate a conversation between a textbook author with specific focus and an expert."""
 
     def __init__(
         self,
@@ -53,7 +53,7 @@ class ConvSimulator(dspy.Module):
     ):
         """
         topic: The topic to research.
-        persona: The persona of the Wikipedia writer.
+        persona: The focus of the textbook author.
         ground_truth_url: The ground_truth_url will be excluded from search to avoid ground truth leakage in evaluation.
         """
         dlg_history: List[DialogueTurn] = []
@@ -62,7 +62,7 @@ class ConvSimulator(dspy.Module):
                 topic=topic, persona=persona, dialogue_turns=dlg_history
             ).question
             if user_utterance == "":
-                logging.error("Simulated Wikipedia writer utterance is empty.")
+                logging.error("Simulated textbook author utterance is empty.")
                 break
             if user_utterance.startswith("Thank you so much for your help!"):
                 break
@@ -126,26 +126,26 @@ class WikiWriter(dspy.Module):
 
 
 class AskQuestion(dspy.Signature):
-    """You are an experienced Wikipedia writer. You are chatting with an expert to get information for the topic you want to contribute. Ask good questions to get more useful information relevant to the topic.
+    """You are an experienced university textbook author. You are chatting with an expert to get information for the textbook chapter you want to write. Ask good questions to get useful information relevant to the chapter scope, learning objectives, and required concepts.
     When you have no more question to ask, say "Thank you so much for your help!" to end the conversation.
-    Please only ask a question at a time and don't ask what you have asked before. Your questions should be related to the topic you want to write.
+    Please only ask a question at a time and don't ask what you have asked before. Your questions should be related to the chapter you want to write.
     """
 
-    topic = dspy.InputField(prefix="Topic you want to write: ", format=str)
+    topic = dspy.InputField(prefix="Textbook chapter context: ", format=str)
     conv = dspy.InputField(prefix="Conversation history:\n", format=str)
     question = dspy.OutputField(format=str)
 
 
 class AskQuestionWithPersona(dspy.Signature):
-    """You are an experienced Wikipedia writer and want to edit a specific page. Besides your identity as a Wikipedia writer, you have specific focus when researching the topic.
+    """You are an experienced university textbook author. You have a specific focus when researching this chapter.
     Now, you are chatting with an expert to get information. Ask good questions to get more useful information.
     When you have no more question to ask, say "Thank you so much for your help!" to end the conversation.
-    Please only ask a question at a time and don't ask what you have asked before. Your questions should be related to the topic you want to write.
+    Please only ask a question at a time and don't ask what you have asked before. Your questions should be related to the chapter you want to write.
     """
 
-    topic = dspy.InputField(prefix="Topic you want to write: ", format=str)
+    topic = dspy.InputField(prefix="Textbook chapter context: ", format=str)
     persona = dspy.InputField(
-        prefix="Your persona besides being a Wikipedia writer: ", format=str
+        prefix="Your research focus besides being a textbook author: ", format=str
     )
     conv = dspy.InputField(prefix="Conversation history:\n", format=str)
     question = dspy.OutputField(format=str)
@@ -159,17 +159,17 @@ class QuestionToQuery(dspy.Signature):
     ...
     - query n"""
 
-    topic = dspy.InputField(prefix="Topic you are discussing about: ", format=str)
+    topic = dspy.InputField(prefix="Textbook chapter context: ", format=str)
     question = dspy.InputField(prefix="Question you want to answer: ", format=str)
     queries = dspy.OutputField(format=str)
 
 
 class AnswerQuestion(dspy.Signature):
-    """You are an expert who can use information effectively. You are chatting with a Wikipedia writer who wants to write a Wikipedia page on topic you know. You have gathered the related information and will now use the information to form a response.
+    """You are an expert who can use information effectively. You are chatting with a textbook author who wants to write a university-level textbook chapter. You have gathered the related information and will now use the information to form a response.
     Make your response as informative as possible, ensuring that every sentence is supported by the gathered information. If the [gathered information] is not directly related to the [topic] or [question], provide the most relevant answer based on the available information. If no appropriate answer can be formulated, respond with, “I cannot answer this question based on the available information,” and explain any limitations or gaps.
     """
 
-    topic = dspy.InputField(prefix="Topic you are discussing about:", format=str)
+    topic = dspy.InputField(prefix="Textbook chapter context:", format=str)
     conv = dspy.InputField(prefix="Question:\n", format=str)
     info = dspy.InputField(prefix="Gathered information:\n", format=str)
     answer = dspy.OutputField(
