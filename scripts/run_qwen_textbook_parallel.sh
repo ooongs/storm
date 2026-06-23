@@ -17,6 +17,7 @@ CACHE_MODE="${CACHE_MODE:-implicit}"
 QWEN_STRONG_THINKING="${QWEN_STRONG_THINKING:-on}"
 QWEN_STRONG_THINKING_BUDGET="${QWEN_STRONG_THINKING_BUDGET:-4096}"
 QWEN_WEAK_THINKING="${QWEN_WEAK_THINKING:-off}"
+POLISH_ARTICLE="${POLISH_ARTICLE:-0}"
 
 args=(
   --benchmark-path "$BENCHMARK_PATH"
@@ -54,6 +55,10 @@ if [[ "${STOP_ON_ERROR:-0}" == "1" ]]; then
   args+=(--stop-on-error)
 fi
 
+if [[ "$POLISH_ARTICLE" == "1" ]]; then
+  args+=(--do-polish-article)
+fi
+
 echo "Running Qwen textbook benchmark"
 echo "  benchmark: $BENCHMARK_PATH"
 echo "  output: $OUTPUT_DIR"
@@ -61,5 +66,6 @@ echo "  models: $STRONG_MODEL / $WEAK_MODEL"
 echo "  parallel_chapters: $PARALLEL_CHAPTERS"
 echo "  max_thread_num: $MAX_THREAD_NUM"
 echo "  cache_mode: $CACHE_MODE"
+echo "  polish_article: $POLISH_ARTICLE"
 
 python examples/textbook_benchmark/run_textbook_baselines.py "${args[@]}"

@@ -341,35 +341,49 @@ def build_research_context(chapter: dict, outline: str, budgets: Dict[str, int])
     return "\n".join(parts)
 
 
+def build_writer_topic(chapter: dict) -> str:
+    length = length_budget(chapter)
+    parts = [
+        f"Chapter title: {chapter.get('chapter_title', '')}",
+        f"Book title: {chapter.get('metadata', {}).get('book_title', '')}",
+        f"Required word budget: target {length['target_words']} words, range {length['word_range']}",
+        "Task: write a university textbook chapter section. Use only the section-specific requirements provided in the writing context.",
+    ]
+    return "\n".join(parts)
+
+
 def section_knowledge_unit_count(section: dict) -> int:
     return sum(
         len(subsection.get("knowledge_units", [])) for subsection in ordered_subsections(section)
     )
 
 
-def build_section_contexts(chapter: dict, outline: str) -> Dict[str, str]:
+def build_section_context(
+    chapter: dict,
+    section: Optional[dict],
+    section_heading: str,
+    outline: str,
+    section_target: int,
+) -> str:
     length = length_budget(chapter)
-    total_ku = max(1, sum(section_knowledge_unit_count(section) for section in ordered_sections(chapter)))
-    contexts = {}
-    for section in ordered_sections(chapter):
-        section_heading = clean_heading(section.get("heading"))
-        if not section_heading:
-            continue
-        section_ku = section_knowledge_unit_count(section)
-        section_target = max(400, round(length["target_words"] * section_ku / total_ku))
-        parts = [
-            "Write this as university textbook prose, not a Wikipedia article.",
-            "Use the provided section outline exactly. In the raw STORM section, start with '# {0}', use '##' for listed subsections, and use '###' only for necessary lower-level headings. The final exporter will demote headings so the chapter title is the only level-1 heading.".format(
-                section_heading
-            ),
-            "Do not use raw headings deeper than ###. The final Markdown must not exceed ####.",
-            "Cover every listed learning objective and knowledge unit for this section.",
-            "Use equations, examples, and explanatory paragraphs when useful. Keep inline citations like [1] when source information supports a claim.",
-            f"Approximate section target: {section_target} words as part of a chapter target of {length['target_words']} words.",
-            "Full fixed chapter outline:",
-            outline,
-            f"Current section: {section_heading}",
-        ]
+    parts = [
+        "Write this as university textbook prose, not a Wikipedia article.",
+        "Use the provided section outline exactly. In the raw STORM section, start with '# {0}', use '##' for listed subsections, and use '###' only for necessary lower-level headings. The final exporter will demote headings so the chapter title is the only level-1 heading.".format(
+            section_heading
+        ),
+        "Do not use raw headings deeper than ###. The final Markdown must not exceed ####.",
+        "Use equations, examples, and explanatory paragraphs when useful. Keep inline citations like [1] when source information supports a claim.",
+        f"Approximate section target: {section_target} words as part of a chapter target of {length['target_words']} words.",
+        "Full chapter outline:",
+        outline,
+        f"Current section: {section_heading}",
+    ]
+    if section is None:
+        parts.append(
+            "No benchmark learning objectives or knowledge units are assigned to this generated section."
+        )
+    else:
+        parts.append("Cover every listed learning objective and knowledge unit for this section.")
         objectives = format_objectives(section)
         if objectives:
             parts.append("Learning objectives for this section:")
@@ -377,11 +391,57 @@ def build_section_contexts(chapter: dict, outline: str) -> Dict[str, str]:
         for subsection in ordered_subsections(section):
             subsection_heading = clean_heading(subsection.get("heading"))
             units = format_knowledge_units(subsection)
-            parts.append(f"Subsection: {subsection_heading}")
+            subsection_label = subsection_heading or subsection.get(
+                "subsection_id", "Untitled subsection"
+            )
+            parts.append(f"Subsection: {subsection_label}")
             if units:
                 parts.append("Knowledge units:")
                 parts.extend(f"- {unit}" for unit in units)
-        contexts[section_heading] = "\n".join(parts)
+    return "\n".join(parts)
+
+
+def build_section_contexts(
+    chapter: dict, outline: str, section_names: Optional[List[str]] = None
+) -> Dict[str, str]:
+    length = length_budget(chapter)
+    sections = ordered_sections(chapter)
+    total_ku = max(1, sum(section_knowledge_unit_count(section) for section in sections))
+    contexts = {}
+    if section_names is None:
+        for section in sections:
+            section_heading = clean_heading(section.get("heading"))
+            if not section_heading:
+                continue
+            section_ku = section_knowledge_unit_count(section)
+            section_target = max(400, round(length["target_words"] * section_ku / total_ku))
+            contexts[section_heading] = build_section_context(
+                chapter=chapter,
+                section=section,
+                section_heading=section_heading,
+                outline=outline,
+                section_target=section_target,
+            )
+        return contexts
+
+    for index, section_name in enumerate(section_names):
+        section_heading = clean_heading(section_name)
+        if not section_heading:
+            continue
+        section = sections[index] if index < len(sections) else None
+        section_ku = section_knowledge_unit_count(section) if section else 0
+        section_target = (
+            max(400, round(length["target_words"] * section_ku / total_ku))
+            if section
+            else max(300, round(length["target_words"] / max(1, len(section_names))))
+        )
+        contexts[section_heading] = build_section_context(
+            chapter=chapter,
+            section=section,
+            section_heading=section_heading,
+            outline=outline,
+            section_target=section_target,
+        )
     return contexts
 
 
@@ -621,7 +681,8 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     budgets = compute_budgets(chapter)
     length = length_budget(chapter)
     research_context = build_research_context(chapter, fixed_outline, budgets)
-    section_contexts = {} if use_storm_outline else build_section_contexts(chapter, fixed_outline)
+    writer_topic = build_writer_topic(chapter)
+    section_contexts = {}
 
     log = {
         "chapter_id": chapter_id,
@@ -644,7 +705,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     try:
         runner, rm = build_runner(args, budgets, raw_dir)
         runner.topic = research_context
-        runner.storm_article_generation.set_section_contexts(section_contexts)
+        runner.storm_article_generation.set_writer_topic(writer_topic)
         runner.storm_article_generation.set_skip_introduction_and_conclusion(False)
 
         information_table = runner.run_knowledge_curation_module(
@@ -660,15 +721,26 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 topic=research_context, outline_str=fixed_outline
             )
             article_outline.dump_outline_to_file(str(raw_dir / "storm_gen_outline.txt"))
+        outline_for_writer = "\n".join(
+            article_outline.get_outline_as_list(add_hashtags=True, include_root=False)
+        )
+        section_contexts = build_section_contexts(
+            chapter,
+            outline_for_writer,
+            article_outline.get_first_level_section_names() if use_storm_outline else None,
+        )
+        runner.storm_article_generation.set_section_contexts(section_contexts)
         draft_article = runner.run_article_generation_module(
             outline=article_outline,
             information_table=information_table,
             callback_handler=BaseCallbackHandler(),
         )
-        final_article = runner.run_article_polishing_module(
-            draft_article=draft_article,
-            remove_duplicate=False,
-        )
+        final_article = draft_article
+        if args.do_polish_article:
+            final_article = runner.run_article_polishing_module(
+                draft_article=draft_article,
+                remove_duplicate=False,
+            )
         runner.post_run()
 
         markdown = format_textbook_markdown(
@@ -699,8 +771,10 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 "token_usage": runner.lm_cost,
                 "retriever_usage": runner.rm_cost,
                 "search_metrics": search_metrics,
+                "section_context_count": len(section_contexts),
                 "polishing": {
-                    "summary_only": True,
+                    "enabled": args.do_polish_article,
+                    "summary_only": args.do_polish_article,
                     "remove_duplicate": False,
                 },
                 "warnings": warnings,
@@ -739,6 +813,11 @@ def dry_run_chapter(chapter: dict, args) -> dict:
         "budgets": budgets,
         "outline_line_count": len(outline.splitlines()),
         "section_context_count": len(section_contexts),
+        "polishing": {
+            "enabled": args.do_polish_article,
+            "summary_only": args.do_polish_article,
+            "remove_duplicate": False,
+        },
     }
 
 
@@ -905,6 +984,11 @@ def main() -> int:
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--smoke-then-full", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument(
+        "--do-polish-article",
+        action="store_true",
+        help="If set, add the default STORM summary polishing step. Disabled by default.",
+    )
     parser.add_argument(
         "--provider",
         choices=["auto", "openai", "qwen"],

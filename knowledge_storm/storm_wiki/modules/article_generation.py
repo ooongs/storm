@@ -30,10 +30,14 @@ class StormArticleGenerationModule(ArticleGenerationModule):
         self.max_thread_num = max_thread_num
         self.section_gen = ConvToSection(engine=self.article_gen_lm)
         self.section_context_by_name: Dict[str, str] = {}
+        self.writer_topic = None
         self.skip_introduction_and_conclusion = True
 
     def set_section_contexts(self, section_context_by_name: Dict[str, str]):
         self.section_context_by_name = section_context_by_name or {}
+
+    def set_writer_topic(self, writer_topic: str):
+        self.writer_topic = writer_topic
 
     def set_skip_introduction_and_conclusion(self, value: bool):
         self.skip_introduction_and_conclusion = value
@@ -47,7 +51,7 @@ class StormArticleGenerationModule(ArticleGenerationModule):
                 queries=section_query, search_top_k=self.retrieve_top_k
             )
         output = self.section_gen(
-            topic=topic,
+            topic=self.writer_topic or topic,
             outline=section_outline,
             section=section_name,
             collected_info=collected_info,
