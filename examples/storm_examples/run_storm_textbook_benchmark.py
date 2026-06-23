@@ -89,6 +89,67 @@ def qwen_extra_body(thinking_mode: str, thinking_budget: Optional[int]) -> Optio
     return extra_body
 
 
+def normalize_source_match_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
+
+
+def source_to_match_text(source) -> str:
+    if isinstance(source, dict):
+        parts = [
+            source.get("url", ""),
+            source.get("link", ""),
+            source.get("title", ""),
+            source.get("description", ""),
+        ]
+        parts.extend(source.get("snippets") or [])
+        return normalize_source_match_text(" ".join(str(part or "") for part in parts))
+    return normalize_source_match_text(str(source or ""))
+
+
+def matches_leakage_phrase(text: str, leakage_phrases: List[str]) -> bool:
+    normalized = normalize_source_match_text(text)
+    compact = normalized.replace(" ", "")
+    for phrase in leakage_phrases:
+        if phrase in normalized:
+            return True
+        if phrase.replace(" ", "") in compact:
+            return True
+    return False
+
+
+def chapter_leakage_phrases(chapter: dict) -> List[str]:
+    metadata = chapter.get("metadata") or {}
+    phrases = [
+        chapter.get("book_title"),
+        metadata.get("book_title"),
+        chapter.get("book_slug"),
+        metadata.get("book_slug"),
+        chapter.get("dataset_id"),
+        chapter.get("id"),
+        metadata.get("id"),
+    ]
+    for source_file in (metadata.get("chapter") or {}).get("source_page_files", []):
+        phrases.append(Path(source_file).stem)
+
+    normalized = []
+    for phrase in phrases:
+        text = normalize_source_match_text(str(phrase or ""))
+        if len(text) >= 12 and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def make_chapter_source_filter(chapter: dict):
+    leakage_phrases = chapter_leakage_phrases(chapter)
+
+    def is_valid(source) -> bool:
+        if not is_allowed_source(source):
+            return False
+        return not matches_leakage_phrase(source_to_match_text(source), leakage_phrases)
+
+    return is_valid
+
+
 def chapter_needs_generated_headings(chapter: dict) -> bool:
     for section in ordered_sections(chapter):
         if not clean_heading(section.get("heading")):
@@ -313,13 +374,21 @@ def build_research_context(chapter: dict, outline: str, budgets: Dict[str, int])
         f"Book title: {chapter.get('metadata', {}).get('book_title', '')}",
         f"Required word budget: target {length['target_words']} words, range {length['word_range']}",
         "Task: gather information for a university textbook chapter. Use the learning objectives and knowledge units as requirements.",
+        "Data leakage rule: do not search for, cite, quote, or rely on the source textbook, exact book title, source chapter pages, mirror PDFs, or benchmark source files. Use independent sources for general concepts only.",
         f"Search budget: at most {budgets['query_budget']} queries and {budgets['source_budget']} accepted sources.",
     ]
     if outline:
         parts.extend(["Fixed outline:", outline])
     else:
-        parts.append(
-            "No fixed outline is provided. The STORM outline generation stage must infer an appropriate textbook outline from the requirements below."
+        parts.extend(
+            [
+                "No fixed outline is provided. The STORM outline generation stage must infer an appropriate textbook outline from the requirements below.",
+                (
+                    f"Outline requirement: create exactly {budgets['section_count']} top-level sections, "
+                    "one for each input section in the same order. Do not add extra top-level introduction, conclusion, or summary sections."
+                ),
+                "Use raw outline headings as '# Section', optional '## Subsection', and optional '### Subsubsection'. Do not include the chapter title as an outline heading.",
+            ]
         )
     for section in ordered_sections(chapter):
         section_heading = clean_heading(section.get("heading"))
@@ -475,19 +544,72 @@ def max_heading_depth(markdown: str) -> int:
     return max(depths, default=0)
 
 
+def markdown_headings(markdown: str) -> List[Tuple[int, str]]:
+    headings = []
+    for match in re.finditer(r"^(#{1,6})\s+(.*?)\s*$", markdown, flags=re.MULTILINE):
+        headings.append((len(match.group(1)), clean_heading(match.group(2))))
+    return headings
+
+
+def output_structure_metrics(
+    chapter: dict, markdown: str, ignore_summary: bool = False
+) -> Dict[str, object]:
+    headings = markdown_headings(markdown)
+    h2_headings = [title for level, title in headings if level == 2]
+    counted_h2_headings = [
+        title
+        for title in h2_headings
+        if not (ignore_summary and title.lower() == "summary")
+    ]
+    expected_section_count = len(ordered_sections(chapter))
+    actual_section_count = len(counted_h2_headings)
+    return {
+        "expected_section_count": expected_section_count,
+        "actual_section_count": actual_section_count,
+        "section_count_matches": actual_section_count == expected_section_count,
+        "section_headings": counted_h2_headings,
+        "raw_h2_headings": h2_headings,
+        "max_heading_depth": max((level for level, _ in headings), default=0),
+        "heading_level_counts": {
+            str(level): count for level, count in Counter(level for level, _ in headings).items()
+        },
+    }
+
+
 class BudgetedSerperRM(SerperRM):
-    def __init__(self, query_budget: int, source_budget: int, *args, **kwargs):
+    def __init__(
+        self,
+        query_budget: int,
+        source_budget: int,
+        *args,
+        blocked_query_phrases: Optional[List[str]] = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self.query_budget = query_budget
         self.source_budget = source_budget
         self.query_count = 0
         self.accepted_source_count = 0
         self.skipped_query_count = 0
+        self.blocked_leakage_query_count = 0
         self.skipped_source_budget_count = 0
+        self.blocked_query_phrases = blocked_query_phrases or []
         self._budget_lock = threading.Lock()
 
     def forward(self, query_or_queries, exclude_urls: List[str] = []):
-        queries = [query_or_queries] if isinstance(query_or_queries, str) else list(query_or_queries)
+        requested_queries = (
+            [query_or_queries] if isinstance(query_or_queries, str) else list(query_or_queries)
+        )
+        queries = []
+        for query in requested_queries:
+            if matches_leakage_phrase(str(query), self.blocked_query_phrases):
+                self.blocked_leakage_query_count += 1
+                continue
+            queries.append(query)
+
+        if not queries:
+            return []
+
         with self._budget_lock:
             if self.accepted_source_count >= self.source_budget:
                 self.skipped_query_count += len(queries)
@@ -521,6 +643,7 @@ class BudgetedSerperRM(SerperRM):
             "accepted_source_count": self.accepted_source_count,
             "raw_search_result_count": self.raw_result_count,
             "leakage_blocked_count": self.filtered_by_source_count,
+            "leakage_query_blocked_count": self.blocked_leakage_query_count,
             "exclude_url_blocked_count": self.filtered_by_exclude_count,
             "skipped_query_count": self.skipped_query_count,
             "skipped_source_budget_count": self.skipped_source_budget_count,
@@ -609,7 +732,26 @@ def chapter_log_path(output_dir: Path, output_id: str) -> Path:
     return output_dir / "logs" / f"{output_id}.json"
 
 
-def existing_success(output_dir: Path, output_id: str) -> Optional[dict]:
+def existing_has_leaked_sources(output_dir: Path, output_id: str, chapter: dict) -> bool:
+    reference_path = raw_artifact_dir(output_dir, output_id) / "url_to_info.json"
+    if not reference_path.exists():
+        return True
+    try:
+        references = read_json(reference_path)
+    except Exception:
+        return True
+
+    source_filter = make_chapter_source_filter(chapter)
+    for url, info in (references.get("url_to_info") or {}).items():
+        source = dict(info or {})
+        source["url"] = url
+        if not source_filter(source):
+            return True
+    return False
+
+
+def existing_success(output_dir: Path, chapter: dict) -> Optional[dict]:
+    output_id = chapter_output_id(chapter)
     log_path = chapter_log_path(output_dir, output_id)
     md_path = chapter_markdown_path(output_dir, output_id)
     if not log_path.exists() or not md_path.exists():
@@ -624,20 +766,33 @@ def existing_success(output_dir: Path, output_id: str) -> Optional[dict]:
         return None
     if log.get("actual_word_count", 0) < 50 or log.get("max_heading_depth", 99) > 4:
         return None
+    structure_metrics = output_structure_metrics(
+        chapter,
+        markdown,
+        ignore_summary=log.get("polishing", {}).get("enabled", False),
+    )
+    if not structure_metrics["section_count_matches"]:
+        return None
+    if existing_has_leaked_sources(output_dir, output_id, chapter):
+        return None
     log["markdown"] = markdown
+    log["structure"] = structure_metrics
     log["skipped_existing"] = True
     return log
 
 
-def build_runner(args, budgets: Dict[str, int], raw_dir: Path) -> Tuple[STORMWikiRunner, BudgetedSerperRM]:
+def build_runner(
+    args, budgets: Dict[str, int], raw_dir: Path, chapter: dict
+) -> Tuple[STORMWikiRunner, BudgetedSerperRM]:
     query_params = dict(DEFAULT_QUERY_PARAMS)
     rm = BudgetedSerperRM(
         query_budget=budgets["query_budget"],
         source_budget=budgets["source_budget"],
+        blocked_query_phrases=chapter_leakage_phrases(chapter),
         serper_search_api_key=os.getenv("SERPER_API_KEY"),
         k=args.search_top_k,
         query_params=query_params,
-        is_valid_source=is_allowed_source,
+        is_valid_source=make_chapter_source_filter(chapter),
         ENABLE_EXTRA_SNIPPET_EXTRACTION=args.extra_snippet_extraction,
     )
     max_conv_turn = (
@@ -665,7 +820,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     chapter_id = chapter["chapter_id"]
     output_id = chapter_output_id(chapter)
     if not args.overwrite:
-        existing = existing_success(output_dir, output_id)
+        existing = existing_success(output_dir, chapter)
         if existing is not None:
             return existing
 
@@ -703,7 +858,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     write_json(log_path, log)
 
     try:
-        runner, rm = build_runner(args, budgets, raw_dir)
+        runner, rm = build_runner(args, budgets, raw_dir, chapter)
         runner.topic = research_context
         runner.storm_article_generation.set_writer_topic(writer_topic)
         runner.storm_article_generation.set_skip_introduction_and_conclusion(False)
@@ -752,6 +907,21 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
             raise RuntimeError(
                 f"Generated markdown is too short ({actual_word_count} words)."
             )
+        structure_metrics = output_structure_metrics(
+            chapter, markdown, ignore_summary=args.do_polish_article
+        )
+        if structure_metrics["max_heading_depth"] > 4:
+            raise RuntimeError(
+                "Generated markdown has headings deeper than level 4 "
+                f"(max depth {structure_metrics['max_heading_depth']})."
+            )
+        if not structure_metrics["section_count_matches"]:
+            raise RuntimeError(
+                "Generated section count does not match dataset structure: "
+                f"expected {structure_metrics['expected_section_count']} H2 sections, "
+                f"got {structure_metrics['actual_section_count']} H2 sections "
+                f"({structure_metrics['section_headings']})."
+            )
         md_path.write_text(markdown, encoding="utf-8")
 
         elapsed = time.time() - start_time
@@ -766,7 +936,8 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 "status": "success",
                 "elapsed_seconds": elapsed,
                 "actual_word_count": actual_word_count,
-                "max_heading_depth": max_heading_depth(markdown),
+                "max_heading_depth": structure_metrics["max_heading_depth"],
+                "structure": structure_metrics,
                 "stage_runtime_seconds": runner.time,
                 "token_usage": runner.lm_cost,
                 "retriever_usage": runner.rm_cost,
@@ -811,6 +982,10 @@ def dry_run_chapter(chapter: dict, args) -> dict:
         "outline_source": "storm_generated" if use_storm_outline else "benchmark_fixed",
         "length_budget": length_budget(chapter),
         "budgets": budgets,
+        "structure": {
+            "expected_section_count": len(ordered_sections(chapter)),
+            "expected_final_heading_shape": "# Chapter, ## Section, optional ### Subsection, optional #### Subsubsection",
+        },
         "outline_line_count": len(outline.splitlines()),
         "section_context_count": len(section_contexts),
         "polishing": {
@@ -854,6 +1029,10 @@ def summarize(results: List[dict]) -> dict:
         ),
         "total_leakage_blocked": sum(
             result.get("search_metrics", {}).get("leakage_blocked_count", 0)
+            for result in successful
+        ),
+        "total_leakage_query_blocked": sum(
+            result.get("search_metrics", {}).get("leakage_query_blocked_count", 0)
             for result in successful
         ),
     }

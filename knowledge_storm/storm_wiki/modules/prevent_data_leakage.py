@@ -17,7 +17,9 @@ LEAKAGE_DOMAIN_PATTERNS = {
     "minnstate.pressbooks.pub",
     "ecampusontario.pressbooks.pub",
     "pressbooks.atlanticoer-relatlantique.ca",
+    "erau.edu",
     "eaglepubs.erau.edu",
+    "commons.erau.edu",
 }
 
 LEAKAGE_HOST_KEYWORDS = {
@@ -26,6 +28,7 @@ LEAKAGE_HOST_KEYWORDS = {
 
 
 def _normalize_host(url_or_host):
+    url_or_host = _source_url(url_or_host)
     value = (url_or_host or "").strip().lower()
     if not value:
         return ""
@@ -45,10 +48,63 @@ def _normalize_host(url_or_host):
     return host
 
 
-def is_leakage_url(url):
-    host = _normalize_host(url)
+def _source_url(source):
+    if isinstance(source, dict):
+        return (
+            source.get("url")
+            or source.get("link")
+            or source.get("host")
+            or ""
+        )
+    return source or ""
+
+
+def _source_text(source):
+    if isinstance(source, dict):
+        parts = [
+            source.get("url", ""),
+            source.get("link", ""),
+            source.get("title", ""),
+            source.get("description", ""),
+        ]
+        parts.extend(source.get("snippets") or [])
+        return " ".join(str(part or "") for part in parts).lower()
+    return str(source or "").lower()
+
+
+def _url_path(source):
+    value = (_source_url(source) or "").strip()
+    if not value:
+        return ""
+    if "://" not in value:
+        value = f"https://{value}"
+    try:
+        from urllib.parse import urlparse
+
+        return urlparse(value).path.lower()
+    except Exception:
+        return value.lower()
+
+
+def _is_edu_host(host):
+    return host == "edu" or host.endswith(".edu")
+
+
+def _is_edu_pdf_source(source, host):
+    if not _is_edu_host(host):
+        return False
+    path = _url_path(source)
+    text = _source_text(source)
+    return path.endswith(".pdf") or ".pdf/" in path or "[pdf]" in text
+
+
+def is_leakage_url(source):
+    host = _normalize_host(source)
     if not host:
         return False
+
+    if _is_edu_pdf_source(source, host):
+        return True
 
     for domain in LEAKAGE_DOMAIN_PATTERNS:
         normalized_domain = _normalize_host(domain)

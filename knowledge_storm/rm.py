@@ -471,6 +471,20 @@ class SerperRM(dspy.Retrieve):
 
         self.base_url = "https://google.serper.dev"
 
+    def _is_valid_search_result(
+        self, url: str, title: str = "", snippets: List[str] = None, description: str = ""
+    ) -> bool:
+        source = {
+            "url": url,
+            "title": title or "",
+            "snippets": snippets or [],
+            "description": description or "",
+        }
+        try:
+            return self.is_valid_source(source)
+        except (AttributeError, TypeError):
+            return self.is_valid_source(url)
+
     def serper_runner(self, query_params):
         self.search_url = f"{self.base_url}/search"
 
@@ -544,7 +558,11 @@ class SerperRM(dspy.Retrieve):
                         continue
                     if url in exclude_urls:
                         continue
-                    if not self.is_valid_source(url):
+                    if not self._is_valid_search_result(
+                        url=url,
+                        title=organic.get("title"),
+                        snippets=[organic.get("snippet")],
+                    ):
                         continue
                     if url:
                         urls.append(url)
@@ -563,10 +581,20 @@ class SerperRM(dspy.Retrieve):
                     if not url or url in exclude_urls:
                         self.filtered_by_exclude_count += 1
                         continue
-                    if not self.is_valid_source(url):
+                    snippets = [organic.get("snippet")]
+                    description = (
+                        knowledge_graph.get("description")
+                        if knowledge_graph is not None
+                        else ""
+                    )
+                    if not self._is_valid_search_result(
+                        url=url,
+                        title=organic.get("title"),
+                        snippets=snippets,
+                        description=description,
+                    ):
                         self.filtered_by_source_count += 1
                         continue
-                    snippets = [organic.get("snippet")]
                     if self.ENABLE_EXTRA_SNIPPET_EXTRACTION:
                         snippets.extend(
                             valid_url_to_snippets.get(url, {}).get("snippets", [])
@@ -576,11 +604,7 @@ class SerperRM(dspy.Retrieve):
                             "snippets": snippets,
                             "title": organic.get("title"),
                             "url": url,
-                            "description": (
-                                knowledge_graph.get("description")
-                                if knowledge_graph is not None
-                                else ""
-                            ),
+                            "description": description,
                         }
                     )
             except:
