@@ -32,6 +32,11 @@ from knowledge_storm.storm_wiki.modules.prevent_data_leakage import is_allowed_s
 from knowledge_storm.storm_wiki.modules.storm_dataclass import StormArticle
 from knowledge_storm.utils import FileIOHelper
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 
 DEFAULT_OUTPUT_DIR = Path("results/textbook_benchmark")
 DEFAULT_BENCHMARK_PATH = Path("chapter_benchmark_final_outline_blind.jsonl")
@@ -793,6 +798,17 @@ def save_progress(output_dir: Path, ordered_results: List[Optional[dict]]) -> Li
     return available_results
 
 
+def progress_enabled(args) -> bool:
+    return tqdm is not None and not args.no_progress
+
+
+def progress_write(args, message: str) -> None:
+    if progress_enabled(args):
+        tqdm.write(message)
+    else:
+        print(message)
+
+
 def run_selected_chapters(chapters: List[dict], args, output_dir: Path) -> List[dict]:
     ordered_results: List[Optional[dict]] = [None] * len(chapters)
 
@@ -802,11 +818,20 @@ def run_selected_chapters(chapters: List[dict], args, output_dir: Path) -> List[
         return run_chapter(chapter, args, output_dir)
 
     if args.parallel_chapters <= 1:
-        for index, chapter in enumerate(chapters, start=1):
-            print(f"[{index}/{len(chapters)}] start {chapter_output_id(chapter)}")
+        iterator = enumerate(chapters, start=1)
+        if progress_enabled(args):
+            iterator = tqdm(
+                iterator,
+                total=len(chapters),
+                desc="Textbook chapters",
+                unit="chapter",
+            )
+        for index, chapter in iterator:
+            progress_write(args, f"[{index}/{len(chapters)}] start {chapter_output_id(chapter)}")
             result = execute_one(chapter)
             ordered_results[index - 1] = result
-            print(
+            progress_write(
+                args,
                 f"[{index}/{len(chapters)}] done {result.get('output_id', chapter_output_id(chapter))}: {result.get('status')}"
             )
             save_progress(output_dir, ordered_results)
@@ -814,7 +839,8 @@ def run_selected_chapters(chapters: List[dict], args, output_dir: Path) -> List[
                 break
         return [result for result in ordered_results if result is not None]
 
-    print(
+    progress_write(
+        args,
         f"Running {len(chapters)} chapters with {args.parallel_chapters} parallel chapter workers."
     )
     executor = ThreadPoolExecutor(max_workers=args.parallel_chapters)
@@ -823,6 +849,11 @@ def run_selected_chapters(chapters: List[dict], args, output_dir: Path) -> List[
         for index, chapter in enumerate(chapters)
     }
     completed = 0
+    progress_bar = (
+        tqdm(total=len(chapters), desc="Textbook chapters", unit="chapter")
+        if progress_enabled(args)
+        else None
+    )
     try:
         for future in as_completed(future_to_index):
             index = future_to_index[future]
@@ -842,15 +873,20 @@ def run_selected_chapters(chapters: List[dict], args, output_dir: Path) -> List[
                     "traceback": traceback.format_exc(),
                 }
             ordered_results[index] = result
-            print(
+            progress_write(
+                args,
                 f"[{completed}/{len(chapters)}] done {result.get('output_id', chapter_output_id(chapter))}: {result.get('status')}"
             )
+            if progress_bar is not None:
+                progress_bar.update(1)
             save_progress(output_dir, ordered_results)
             if result.get("status") == "failed" and args.stop_on_error:
                 for pending in future_to_index:
                     pending.cancel()
                 break
     finally:
+        if progress_bar is not None:
+            progress_bar.close()
         executor.shutdown(wait=True, cancel_futures=True)
 
     return [result for result in ordered_results if result is not None]
@@ -868,6 +904,7 @@ def main() -> int:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--stop-on-error", action="store_true")
     parser.add_argument("--smoke-then-full", action="store_true")
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
         "--provider",
         choices=["auto", "openai", "qwen"],
