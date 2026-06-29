@@ -27,3 +27,6 @@ secrets.toml
 .venv/
 
 .env
+
+# External upstream checkouts
+external/OmniThink/

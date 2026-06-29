@@ -10,6 +10,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 DIRECT_BASELINES = {"llm", "llm_only", "rag", "rag_serper", "llm_rag"}
+OMNITHINK_BASELINES = {"omnithink", "omni_think"}
 
 
 def requested_baselines(argv):
@@ -25,6 +26,13 @@ def requested_baselines(argv):
 
 def main():
     baselines = requested_baselines(sys.argv[1:])
+    if any(baseline in OMNITHINK_BASELINES for baseline in baselines):
+        from examples.textbook_benchmark.run_omnithink_textbook_benchmark import (
+            main as omnithink_main,
+        )
+
+        return omnithink_main()
+
     if any(baseline in DIRECT_BASELINES for baseline in baselines):
         from examples.textbook_benchmark.run_qwen_direct_baselines import (
             main as direct_main,
