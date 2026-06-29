@@ -367,7 +367,7 @@ def format_knowledge_units(subsection: dict) -> List[str]:
     return [clean_heading(unit.get("text")) for unit in units if clean_heading(unit.get("text"))]
 
 
-def build_research_context(chapter: dict, outline: str, budgets: Dict[str, int]) -> str:
+def build_research_context(chapter: dict, budgets: Dict[str, int]) -> str:
     length = length_budget(chapter)
     parts = [
         f"Chapter title: {chapter.get('chapter_title', '')}",
@@ -377,19 +377,6 @@ def build_research_context(chapter: dict, outline: str, budgets: Dict[str, int])
         "Data leakage rule: do not search for, cite, quote, or rely on the source textbook, exact book title, source chapter pages, mirror PDFs, or benchmark source files. Use independent sources for general concepts only.",
         f"Search budget: at most {budgets['query_budget']} queries and {budgets['source_budget']} accepted sources.",
     ]
-    if outline:
-        parts.extend(["Fixed outline:", outline])
-    else:
-        parts.extend(
-            [
-                "No fixed outline is provided. The STORM outline generation stage must infer an appropriate textbook outline from the requirements below.",
-                (
-                    f"Outline requirement: create exactly {budgets['section_count']} top-level sections, "
-                    "one for each input section in the same order. Do not add extra top-level introduction, conclusion, or summary sections."
-                ),
-                "Use raw outline headings as '# Section', optional '## Subsection', and optional '### Subsubsection'. Do not include the chapter title as an outline heading.",
-            ]
-        )
     for section in ordered_sections(chapter):
         section_heading = clean_heading(section.get("heading"))
         section_label = section_heading or section.get("section_id", "Untitled section")
@@ -534,6 +521,16 @@ def format_textbook_markdown(chapter_title: str, raw_article: str) -> str:
     markdown = "\n".join(output).strip() + "\n"
     markdown = re.sub(r"\n{3,}", "\n\n", markdown)
     return markdown
+
+
+NUMERIC_CITATION_PATTERN = re.compile(r"\[\d+\]")
+
+
+def strip_numeric_citations(markdown: str) -> str:
+    markdown = re.sub(r"(?:\[\d+\])+", "", markdown)
+    markdown = re.sub(r"[ \t]+([.,;:!?])", r"\1", markdown)
+    markdown = re.sub(r"\n{3,}", "\n\n", markdown)
+    return markdown.strip() + "\n"
 
 
 def max_heading_depth(markdown: str) -> int:
@@ -760,6 +757,8 @@ def existing_success(output_dir: Path, chapter: dict) -> Optional[dict]:
     if log.get("status") != "success":
         return None
     markdown = md_path.read_text(encoding="utf-8")
+    if NUMERIC_CITATION_PATTERN.search(markdown):
+        return None
     actual_word_count = count_words(markdown)
     heading_depth = max_heading_depth(markdown)
     if actual_word_count < 50 or heading_depth > 4:
@@ -835,7 +834,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     fixed_outline = "" if use_storm_outline else build_fixed_outline(chapter)
     budgets = compute_budgets(chapter)
     length = length_budget(chapter)
-    research_context = build_research_context(chapter, fixed_outline, budgets)
+    research_context = build_research_context(chapter, budgets)
     writer_topic = build_writer_topic(chapter)
     section_contexts = {}
 
@@ -853,6 +852,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
             "markdown": str(md_path),
             "log": str(log_path),
             "raw_artifacts": str(raw_dir),
+            "markdown_with_citations": str(raw_dir / "chapter_with_citations.md"),
         },
     }
     write_json(log_path, log)
@@ -898,10 +898,19 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
             )
         runner.post_run()
 
-        markdown = format_textbook_markdown(
+        markdown_with_citations = format_textbook_markdown(
             chapter_title=chapter.get("chapter_title", chapter_id),
             raw_article=final_article.to_string(),
         )
+        (raw_dir / "chapter_with_citations.md").write_text(
+            markdown_with_citations, encoding="utf-8"
+        )
+        citation_count_removed = len(
+            NUMERIC_CITATION_PATTERN.findall(markdown_with_citations)
+        )
+        markdown = strip_numeric_citations(markdown_with_citations)
+        if NUMERIC_CITATION_PATTERN.search(markdown):
+            raise RuntimeError("Generated markdown still contains numeric citation markers.")
         actual_word_count = count_words(markdown)
         if actual_word_count < 50:
             raise RuntimeError(
@@ -947,6 +956,10 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                     "enabled": args.do_polish_article,
                     "summary_only": args.do_polish_article,
                     "remove_duplicate": False,
+                },
+                "citation_stripping": {
+                    "removed_numeric_citation_markers": citation_count_removed,
+                    "with_citations_markdown": str(raw_dir / "chapter_with_citations.md"),
                 },
                 "warnings": warnings,
                 "markdown": markdown,
@@ -1216,14 +1229,14 @@ def main() -> int:
     )
     parser.add_argument(
         "--qwen-weak-thinking",
-        choices=["default", "on", "off"],
-        default="off",
+        choices=["default", "on", "off", "disable"],
+        default="disable",
         help="Thinking mode for the weaker Qwen model used during research/question asking.",
     )
     parser.add_argument(
         "--qwen-strong-thinking",
-        choices=["default", "on", "off"],
-        default="on",
+        choices=["default", "on", "off", "disable"],
+        default="disable",
         help="Thinking mode for the stronger Qwen model used for textbook article generation.",
     )
     parser.add_argument("--qwen-weak-thinking-budget", type=int, default=None)

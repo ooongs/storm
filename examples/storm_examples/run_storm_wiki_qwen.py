@@ -45,6 +45,16 @@ from knowledge_storm.rm import (
 from knowledge_storm.utils import load_api_key
 
 
+def qwen_extra_body(thinking_mode: str, thinking_budget: int | None) -> dict | None:
+    if thinking_mode == "default":
+        return None
+
+    extra_body = {"enable_thinking": thinking_mode == "on"}
+    if thinking_mode == "on" and thinking_budget:
+        extra_body["thinking_budget"] = thinking_budget
+    return extra_body
+
+
 def load_dotenv_file(env_file_path=".env", protected_keys=None):
     if not os.path.exists(env_file_path):
         return
@@ -122,6 +132,7 @@ def make_qwen_lm(model, max_tokens, args):
         cache=args.cache_mode != "off",
         provider_cache=args.cache_mode == "explicit",
         cache_prefix_chars=args.explicit_cache_prefix_chars or None,
+        extra_body=qwen_extra_body(args.qwen_thinking, args.qwen_thinking_budget),
     )
 
 
@@ -230,6 +241,13 @@ if __name__ == "__main__":
             "of each prompt as cacheable. Use 0 to mark the full prompt."
         ),
     )
+    parser.add_argument(
+        "--qwen-thinking",
+        choices=["default", "on", "off", "disable"],
+        default="disable",
+        help="Qwen thinking mode for both qwen3.6 and qwen3.7 model calls.",
+    )
+    parser.add_argument("--qwen-thinking-budget", type=int, default=4096)
     parser.add_argument(
         "--temperature", type=float, default=1.0, help="Sampling temperature to use."
     )

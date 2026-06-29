@@ -830,8 +830,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument(
         "--qwen-thinking",
-        choices=["default", "on", "off"],
-        default="on",
+        choices=["default", "on", "off", "disable"],
+        default="disable",
         help="Qwen thinking mode for both query generation and article generation.",
     )
     parser.add_argument("--qwen-thinking-budget", type=int, default=4096)
