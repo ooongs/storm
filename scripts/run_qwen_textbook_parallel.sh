@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BENCHMARK_PATH="${BENCHMARK_PATH:-chapter_benchmark_final_outline_blind.jsonl}"
-OUTPUT_DIR="${OUTPUT_DIR:-results/textbook_benchmark_final}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/storm_qwen_final}"
 STRONG_MODEL="${STRONG_MODEL:-qwen3.7-plus}"
 WEAK_MODEL="${WEAK_MODEL:-qwen3.6-flash}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
