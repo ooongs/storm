@@ -604,12 +604,13 @@ def provider_from_args(args) -> str:
     return "qwen" if normalized.startswith("qwen") or normalized.startswith("dashscope/qwen") else "openai"
 
 
-def create_lm(args, max_tokens: int):
+def create_lm(args, max_tokens: int, model: Optional[str] = None):
     provider = provider_from_args(args)
+    model = model or args.model
     if provider == "qwen":
         extra_body = qwen_extra_body(args.qwen_thinking, args.qwen_thinking_budget)
         return QwenModel(
-            model=args.model,
+            model=model,
             api_key=os.getenv("DASHSCOPE_API_KEY"),
             api_base=os.getenv("DASHSCOPE_API_BASE", QWEN_DEFAULT_API_BASE),
             max_tokens=max_tokens,
@@ -629,7 +630,7 @@ def create_lm(args, max_tokens: int):
     base_url = os.getenv("OPENAI_BASE_URL")
     if base_url:
         kwargs["api_base"] = base_url
-    return LitellmModel(model=args.model, **kwargs)
+    return LitellmModel(model=model, **kwargs)
 
 
 def model_usage(lms: Dict[str, object]) -> dict:
@@ -860,6 +861,8 @@ def dry_run_task(chapter: dict, baseline: str, args, output_dir: Path) -> dict:
         {
             "status": "dry_run",
             "model": args.model,
+            "article_model": args.model,
+            "aux_model": args.aux_model,
             "provider": provider_from_args(args),
             "omnithink_dir": str(args.omnithink_dir),
             "parallel_chapters": args.parallel_chapters,
@@ -891,6 +894,8 @@ def run_task(chapter: dict, baseline: str, args, output_dir: Path, omni: dict) -
         {
             "status": "running",
             "model": args.model,
+            "article_model": args.model,
+            "aux_model": args.aux_model,
             "provider": provider_from_args(args),
             "omnithink_dir": str(args.omnithink_dir),
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -900,9 +905,9 @@ def run_task(chapter: dict, baseline: str, args, output_dir: Path, omni: dict) -
 
     started = time.time()
     try:
-        outline_lm = create_lm(args, args.outline_max_tokens)
-        section_lm = create_lm(args, args.section_max_tokens)
-        polish_lm = create_lm(args, args.polish_max_tokens)
+        outline_lm = create_lm(args, args.outline_max_tokens, model=args.aux_model)
+        section_lm = create_lm(args, args.section_max_tokens, model=args.model)
+        polish_lm = create_lm(args, args.polish_max_tokens, model=args.aux_model)
         lms = {"outline": outline_lm, "section": section_lm, "polish": polish_lm}
 
         query_candidates = build_mindmap_queries(chapter, args.max_search_queries)
@@ -1183,6 +1188,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         default="auto",
     )
     parser.add_argument("--model", default=os.getenv("QWEN_PLUS_MODEL", "qwen3.7-plus"))
+    parser.add_argument(
+        "--aux-model",
+        default=os.getenv("QWEN_FLASH_MODEL", "qwen3.6-flash"),
+        help="Model for non-article-generation LM calls such as outline and polishing.",
+    )
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=0.9, dest="top_p")
     parser.add_argument("--outline-max-tokens", type=int, default=2400)

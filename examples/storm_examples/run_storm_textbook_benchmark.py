@@ -711,9 +711,9 @@ def create_lm_configs(args) -> STORMWikiLMConfigs:
     lm_configs = STORMWikiLMConfigs()
     lm_configs.set_conv_simulator_lm(weak_lm)
     lm_configs.set_question_asker_lm(weak_lm)
-    lm_configs.set_outline_gen_lm(article_lm)
+    lm_configs.set_outline_gen_lm(weak_lm)
     lm_configs.set_article_gen_lm(article_lm)
-    lm_configs.set_article_polish_lm(article_lm)
+    lm_configs.set_article_polish_lm(weak_lm)
     return lm_configs
 
 
@@ -837,6 +837,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     research_context = build_research_context(chapter, budgets)
     writer_topic = build_writer_topic(chapter)
     section_contexts = {}
+    weak_model, strong_model = resolve_model_pair(args)
 
     log = {
         "chapter_id": chapter_id,
@@ -845,6 +846,15 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
         "benchmark_index": chapter.get("_benchmark_index"),
         "chapter_title": chapter.get("chapter_title"),
         "status": "running",
+        "article_model": strong_model,
+        "aux_model": weak_model,
+        "model_assignments": {
+            "article_generation": strong_model,
+            "knowledge_curation": weak_model,
+            "question_asking": weak_model,
+            "outline_generation": weak_model,
+            "article_polishing": weak_model,
+        },
         "outline_source": "storm_generated" if use_storm_outline else "benchmark_fixed",
         "length_budget": length,
         "budgets": budgets,
@@ -985,6 +995,7 @@ def dry_run_chapter(chapter: dict, args) -> dict:
     outline = "" if use_storm_outline else build_fixed_outline(chapter)
     budgets = compute_budgets(chapter)
     section_contexts = {} if use_storm_outline else build_section_contexts(chapter, outline)
+    weak_model, strong_model = resolve_model_pair(args)
     return {
         "chapter_id": chapter["chapter_id"],
         "dataset_id": chapter.get("dataset_id"),
@@ -992,6 +1003,15 @@ def dry_run_chapter(chapter: dict, args) -> dict:
         "benchmark_index": chapter.get("_benchmark_index"),
         "chapter_title": chapter.get("chapter_title"),
         "status": "dry_run",
+        "article_model": strong_model,
+        "aux_model": weak_model,
+        "model_assignments": {
+            "article_generation": strong_model,
+            "knowledge_curation": weak_model,
+            "question_asking": weak_model,
+            "outline_generation": weak_model,
+            "article_polishing": weak_model,
+        },
         "outline_source": "storm_generated" if use_storm_outline else "benchmark_fixed",
         "length_budget": length_budget(chapter),
         "budgets": budgets,
