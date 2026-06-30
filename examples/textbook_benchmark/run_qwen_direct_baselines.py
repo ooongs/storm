@@ -40,6 +40,7 @@ from examples.storm_examples.run_storm_textbook_benchmark import (
     count_words,
     format_knowledge_units,
     format_objectives,
+    format_section_knowledge_units,
     length_budget,
     load_env_file,
     make_chapter_source_filter,
@@ -175,6 +176,11 @@ def chapter_requirement_markdown(chapter: dict) -> str:
         if objectives:
             lines.append("Learning objectives:")
             lines.extend(f"- {objective}" for objective in objectives)
+        section_units = format_section_knowledge_units(section)
+        if section_units:
+            lines.append("Knowledge units:")
+            lines.extend(f"- {unit}" for unit in section_units)
+            continue
         for group_index, subsection in enumerate(ordered_subsections(section), start=1):
             units = format_knowledge_units(subsection)
             lines.append(f"Knowledge group {group_index} ({subsection.get('subsection_id', '')}):")
@@ -208,7 +214,7 @@ Hard output constraints:
 - Output Markdown only. Do not wrap it in code fences.
 - Start with exactly one H1 heading: # {clean_heading(chapter.get('chapter_title', 'Untitled Chapter'))}
 - Create exactly {section_count} H2 section heading(s), one per input section, in the same order.
-- Under each H2, create H3 headings for the knowledge groups as needed.
+- Under each H2, create H3 headings only when useful for readability.
 - Do not use headings deeper than H4.
 - Do not add extra H2 headings for introduction, conclusion, summary, exercises, references, or sources.
 - Cover every learning objective and knowledge unit.
@@ -271,6 +277,14 @@ def heuristic_queries(chapter: dict, max_queries: int) -> List[str]:
                 queries.append(query)
             if len(queries) >= max_queries:
                 return queries
+        section_units = format_section_knowledge_units(section)
+        if section_units:
+            query = compact_text(" ".join(section_units[:2]), 140)
+            if query and query not in queries:
+                queries.append(query)
+            if len(queries) >= max_queries:
+                return queries
+            continue
         for subsection in ordered_subsections(section):
             units = format_knowledge_units(subsection)
             if not units:

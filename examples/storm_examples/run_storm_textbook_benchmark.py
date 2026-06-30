@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -29,7 +30,7 @@ from knowledge_storm.lm import LitellmModel, QwenModel
 from knowledge_storm.rm import SerperRM
 from knowledge_storm.storm_wiki.modules.callback import BaseCallbackHandler
 from knowledge_storm.storm_wiki.modules.prevent_data_leakage import is_allowed_source
-from knowledge_storm.storm_wiki.modules.storm_dataclass import StormArticle
+from knowledge_storm.storm_wiki.modules.storm_dataclass import StormArticle, StormInformationTable
 from knowledge_storm.utils import FileIOHelper
 
 try:
@@ -172,6 +173,108 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_json_if_exists(path: Path):
+    if not path.exists():
+        return None
+    return read_json(path)
+
+
+def read_text_if_exists(path: Path):
+    if not path.exists():
+        return None
+    return path.read_text(encoding="utf-8")
+
+
+def module_io_dir(raw_dir: Path) -> Path:
+    return raw_dir / "module-io"
+
+
+def checkpoint_path(raw_dir: Path) -> Path:
+    return raw_dir / "checkpoint.json"
+
+
+def load_checkpoint(raw_dir: Path) -> dict:
+    return read_json_if_exists(checkpoint_path(raw_dir)) or {"version": 1, "stages": {}}
+
+
+def save_checkpoint(raw_dir: Path, checkpoint: dict) -> None:
+    checkpoint["version"] = checkpoint.get("version", 1)
+    write_json(checkpoint_path(raw_dir), checkpoint)
+
+
+def update_checkpoint_stage(raw_dir: Path, stage: str, payload: dict) -> dict:
+    checkpoint = load_checkpoint(raw_dir)
+    checkpoint.setdefault("stages", {})[stage] = payload
+    if payload.get("status") == "success":
+        (checkpoint.get("invalidated_stages") or {}).pop(stage, None)
+    save_checkpoint(raw_dir, checkpoint)
+    return checkpoint
+
+
+def invalidate_checkpoint_stage(raw_dir: Path, stage: str, reason: str) -> dict:
+    checkpoint = load_checkpoint(raw_dir)
+    checkpoint.setdefault("invalidated_stages", {})[stage] = {
+        "reason": reason,
+        "timestamp": time.time(),
+    }
+    save_checkpoint(raw_dir, checkpoint)
+    return checkpoint
+
+
+def checkpoint_stage(checkpoint: dict, stage: str) -> dict:
+    return (checkpoint.get("stages") or {}).get(stage) or {}
+
+
+def stage_succeeded(checkpoint: dict, stage: str) -> bool:
+    return checkpoint_stage(checkpoint, stage).get("status") == "success"
+
+
+def stage_invalidated(checkpoint: dict, stage: str) -> bool:
+    return stage in (checkpoint.get("invalidated_stages") or {})
+
+
+def safe_args_snapshot(args) -> dict:
+    snapshot = {}
+    for key, value in vars(args).items():
+        if key in {"env_file"}:
+            snapshot[key] = str(value)
+        elif isinstance(value, Path):
+            snapshot[key] = str(value)
+        else:
+            snapshot[key] = value
+    return snapshot
+
+
+def module_io_path(raw_dir: Path, stage: str, kind: str) -> Path:
+    return module_io_dir(raw_dir) / f"{stage}_{kind}.json"
+
+
+def write_module_io(raw_dir: Path, stage: str, kind: str, payload: dict) -> str:
+    path = module_io_path(raw_dir, stage, kind)
+    write_json(path, payload)
+    return str(path)
+
+
+def append_lm_call_history(raw_dir: Path, runner: STORMWikiRunner, stage: str) -> str:
+    history = runner.lm_configs.collect_and_reset_lm_history()
+    history_path = raw_dir / "llm_call_history.jsonl"
+    if not history:
+        return str(history_path)
+    with history_path.open("a", encoding="utf-8") as handle:
+        for call in history:
+            call = dict(call)
+            call["checkpoint_stage"] = stage
+            call.pop("kwargs", None)
+            handle.write(json.dumps(call, default=str) + "\n")
+    return str(history_path)
+
+
+def write_run_config(raw_dir: Path, runner: STORMWikiRunner) -> str:
+    path = raw_dir / "run_config.json"
+    FileIOHelper.dump_json(runner.lm_configs.log(), str(path))
+    return str(path)
+
+
 def clean_heading(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
@@ -201,6 +304,23 @@ def normalize_outline_blind_chapter(chapter: dict, index: int) -> dict:
     knowledge_unit_count = 0
     for section_index, block in enumerate(chapter.get("section_blocks", [])):
         section_id = block.get("section_id") or f"sec_{section_index + 1:02d}"
+        raw_units = block.get("knowledge_units")
+        if raw_units is None:
+            raw_units = [
+                unit
+                for group in block.get("ku_groups", [])
+                for unit in group.get("knowledge_units", [])
+            ]
+        knowledge_units = [
+            {
+                "ku_id": f"{section_id}_ku_{ku_index + 1:02d}",
+                "text": unit.get("text") if isinstance(unit, dict) else unit,
+                "section_id": section_id,
+                "order_index": ku_index,
+            }
+            for ku_index, unit in enumerate(raw_units)
+        ]
+        knowledge_unit_count += len(knowledge_units)
         section = {
             "section_id": section_id,
             "heading": None,
@@ -214,29 +334,9 @@ def normalize_outline_blind_chapter(chapter: dict, index: int) -> dict:
                     block.get("learning_objectives", [])
                 )
             ],
+            "knowledge_units": knowledge_units,
             "subsections": [],
         }
-        for group_index, group in enumerate(block.get("ku_groups", [])):
-            subsection_id = f"{section_id}_{group.get('group_id') or f'g_{group_index + 1:02d}'}"
-            knowledge_units = [
-                {
-                    "ku_id": f"{subsection_id}_ku_{ku_index + 1:02d}",
-                    "text": unit,
-                    "section_id": section_id,
-                    "subsection_id": subsection_id,
-                    "order_index": ku_index,
-                }
-                for ku_index, unit in enumerate(group.get("knowledge_units", []))
-            ]
-            knowledge_unit_count += len(knowledge_units)
-            section["subsections"].append(
-                {
-                    "subsection_id": subsection_id,
-                    "heading": None,
-                    "order_index": group_index,
-                    "knowledge_units": knowledge_units,
-                }
-            )
         normalized["sections"].append(section)
 
     section_count = len(normalized["sections"])
@@ -311,9 +411,8 @@ def chapter_counts(chapter: dict) -> Tuple[int, int]:
     )
     if knowledge_unit_count is None:
         knowledge_unit_count = sum(
-            len(subsection.get("knowledge_units", []))
+            section_knowledge_unit_count(section)
             for section in sections
-            for subsection in ordered_subsections(section)
         )
     return int(section_count), int(knowledge_unit_count)
 
@@ -360,15 +459,31 @@ def format_objectives(section: dict) -> List[str]:
     ]
 
 
+def knowledge_unit_text(unit) -> str:
+    return clean_heading(unit.get("text") if isinstance(unit, dict) else unit)
+
+
+def knowledge_unit_order(unit) -> int:
+    return int((unit.get("order_index", 0) if isinstance(unit, dict) else 0) or 0)
+
+
 def format_knowledge_units(subsection: dict) -> List[str]:
     units = sorted(
-        subsection.get("knowledge_units", []), key=lambda item: item.get("order_index", 0)
+        subsection.get("knowledge_units", []), key=knowledge_unit_order
     )
-    return [clean_heading(unit.get("text")) for unit in units if clean_heading(unit.get("text"))]
+    return [text for unit in units if (text := knowledge_unit_text(unit))]
+
+
+def format_section_knowledge_units(section: dict) -> List[str]:
+    units = sorted(
+        section.get("knowledge_units", []), key=knowledge_unit_order
+    )
+    return [text for unit in units if (text := knowledge_unit_text(unit))]
 
 
 def build_research_context(chapter: dict, budgets: Dict[str, int]) -> str:
     length = length_budget(chapter)
+    section_count = len(ordered_sections(chapter))
     parts = [
         f"Chapter title: {chapter.get('chapter_title', '')}",
         f"Book title: {chapter.get('metadata', {}).get('book_title', '')}",
@@ -376,6 +491,13 @@ def build_research_context(chapter: dict, budgets: Dict[str, int]) -> str:
         "Task: gather information for a university textbook chapter. Use the learning objectives and knowledge units as requirements.",
         "Data leakage rule: do not search for, cite, quote, or rely on the source textbook, exact book title, source chapter pages, mirror PDFs, or benchmark source files. Use independent sources for general concepts only.",
         f"Search budget: at most {budgets['query_budget']} queries and {budgets['source_budget']} accepted sources.",
+        "Outline constraints:",
+        f"- Create exactly {section_count} top-level outline section(s) using single-# headings.",
+        "- Create one top-level # heading for each Input section, in the same order.",
+        "- Infer concise textbook section titles from each Input section's learning objectives and knowledge units.",
+        "- Do not use the chapter title itself as an outline heading.",
+        "- Do not add extra top-level # headings for introduction, conclusion, summary, exercises, references, or sources unless they correspond to an Input section.",
+        "- Use ## or ### only for lower-level structure inside those required top-level sections.",
     ]
     for section in ordered_sections(chapter):
         section_heading = clean_heading(section.get("heading"))
@@ -385,6 +507,11 @@ def build_research_context(chapter: dict, budgets: Dict[str, int]) -> str:
         if objectives:
             parts.append("Learning objectives:")
             parts.extend(f"- {objective}" for objective in objectives)
+        units = format_section_knowledge_units(section)
+        if units:
+            parts.append("Knowledge units:")
+            parts.extend(f"- {unit}" for unit in units)
+            continue
         for subsection in ordered_subsections(section):
             subsection_heading = clean_heading(subsection.get("heading"))
             units = format_knowledge_units(subsection)
@@ -409,6 +536,9 @@ def build_writer_topic(chapter: dict) -> str:
 
 
 def section_knowledge_unit_count(section: dict) -> int:
+    direct_units = section.get("knowledge_units", [])
+    if direct_units:
+        return len(direct_units)
     return sum(
         len(subsection.get("knowledge_units", [])) for subsection in ordered_subsections(section)
     )
@@ -444,6 +574,11 @@ def build_section_context(
         if objectives:
             parts.append("Learning objectives for this section:")
             parts.extend(f"- {objective}" for objective in objectives)
+        units = format_section_knowledge_units(section)
+        if units:
+            parts.append("Knowledge units:")
+            parts.extend(f"- {unit}" for unit in units)
+            return "\n".join(parts)
         for subsection in ordered_subsections(section):
             subsection_heading = clean_heading(subsection.get("heading"))
             units = format_knowledge_units(subsection)
@@ -571,6 +706,64 @@ def output_structure_metrics(
             str(level): count for level, count in Counter(level for level, _ in headings).items()
         },
     }
+
+
+def outline_structure_metrics(chapter: dict, article_outline: StormArticle) -> Dict[str, object]:
+    outline_markdown = "\n".join(
+        article_outline.get_outline_as_list(add_hashtags=True, include_root=False)
+    )
+    headings = markdown_headings(outline_markdown)
+    first_level_headings = [
+        clean_heading(title) for title in article_outline.get_first_level_section_names()
+    ]
+    expected_section_count = len(ordered_sections(chapter))
+    actual_section_count = len(first_level_headings)
+    return {
+        "expected_section_count": expected_section_count,
+        "actual_section_count": actual_section_count,
+        "section_count_matches": actual_section_count == expected_section_count,
+        "section_headings": first_level_headings,
+        "max_heading_depth": max((level for level, _ in headings), default=0),
+        "heading_level_counts": {
+            str(level): count for level, count in Counter(level for level, _ in headings).items()
+        },
+    }
+
+
+def runner_stage_metrics(runner: STORMWikiRunner, runner_stage_name: str) -> dict:
+    return {
+        "runtime_seconds": runner.time.get(runner_stage_name),
+        "token_usage": runner.lm_cost.get(runner_stage_name),
+        "retriever_usage": runner.rm_cost.get(runner_stage_name),
+    }
+
+
+def merge_cached_stage_metrics(checkpoint: dict, runner: STORMWikiRunner) -> Tuple[dict, dict, dict]:
+    stage_runtime_seconds = dict(runner.time)
+    token_usage = dict(runner.lm_cost)
+    retriever_usage = dict(runner.rm_cost)
+    for stage in (checkpoint.get("stages") or {}).values():
+        metrics = stage.get("metrics") or {}
+        runner_stage_name = stage.get("runner_stage_name")
+        if not runner_stage_name:
+            continue
+        if metrics.get("runtime_seconds") is not None:
+            stage_runtime_seconds.setdefault(runner_stage_name, metrics["runtime_seconds"])
+        if metrics.get("token_usage") is not None:
+            token_usage.setdefault(runner_stage_name, metrics["token_usage"])
+        if metrics.get("retriever_usage") is not None:
+            retriever_usage.setdefault(runner_stage_name, metrics["retriever_usage"])
+    return stage_runtime_seconds, token_usage, retriever_usage
+
+
+def final_export_invalidates_article(error: str) -> bool:
+    validation_markers = [
+        "Generated markdown still contains numeric citation markers",
+        "Generated markdown is too short",
+        "Generated markdown has headings deeper than level 4",
+        "Generated section count does not match dataset structure",
+    ]
+    return any(marker in (error or "") for marker in validation_markers)
 
 
 class BudgetedSerperRM(SerperRM):
@@ -826,8 +1019,25 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     raw_dir = raw_artifact_dir(output_dir, output_id)
     md_path = chapter_markdown_path(output_dir, output_id)
     log_path = chapter_log_path(output_dir, output_id)
+    raw_dir.mkdir(parents=True, exist_ok=True)
     md_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    previous_log = None if args.overwrite else read_json_if_exists(log_path)
+    previous_article_invalid = bool(
+        previous_log
+        and previous_log.get("status") == "failed"
+        and final_export_invalidates_article(previous_log.get("error", ""))
+    )
+    if args.overwrite:
+        for stale_path in [
+            checkpoint_path(raw_dir),
+            raw_dir / "llm_call_history.jsonl",
+            module_io_dir(raw_dir),
+        ]:
+            if stale_path.is_dir():
+                shutil.rmtree(stale_path)
+            elif stale_path.exists():
+                stale_path.unlink()
 
     start_time = time.time()
     use_storm_outline = chapter_needs_generated_headings(chapter)
@@ -838,6 +1048,8 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     writer_topic = build_writer_topic(chapter)
     section_contexts = {}
     weak_model, strong_model = resolve_model_pair(args)
+    checkpoint = load_checkpoint(raw_dir)
+    resume_events = []
 
     log = {
         "chapter_id": chapter_id,
@@ -864,50 +1076,551 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
             "raw_artifacts": str(raw_dir),
             "markdown_with_citations": str(raw_dir / "chapter_with_citations.md"),
         },
+        "checkpoint_path": str(checkpoint_path(raw_dir)),
+        "resume_events": resume_events,
     }
     write_json(log_path, log)
+    write_module_io(
+        raw_dir,
+        "run",
+        "input",
+        {
+            "args": safe_args_snapshot(args),
+            "chapter": chapter,
+            "research_context": research_context,
+            "writer_topic": writer_topic,
+            "use_storm_outline": use_storm_outline,
+            "fixed_outline": fixed_outline,
+            "budgets": budgets,
+            "length_budget": length,
+        },
+    )
 
+    runner = None
+    rm = None
+    current_stage = None
     try:
         runner, rm = build_runner(args, budgets, raw_dir, chapter)
+        write_run_config(raw_dir, runner)
         runner.topic = research_context
         runner.storm_article_generation.set_writer_topic(writer_topic)
         runner.storm_article_generation.set_skip_introduction_and_conclusion(False)
 
-        information_table = runner.run_knowledge_curation_module(
-            ground_truth_url="None", callback_handler=BaseCallbackHandler()
-        )
-        if use_storm_outline:
-            article_outline = runner.run_outline_generation_module(
-                information_table=information_table,
-                callback_handler=BaseCallbackHandler(),
+        conversation_log_path = raw_dir / "conversation_log.json"
+        raw_search_results_path = raw_dir / "raw_search_results.json"
+        information_table = None
+        if (
+            not args.overwrite
+            and conversation_log_path.exists()
+            and (stage_succeeded(checkpoint, "knowledge_curation") or not checkpoint_stage(checkpoint, "knowledge_curation"))
+        ):
+            information_table = StormInformationTable.from_conversation_log_file(
+                str(conversation_log_path)
             )
+            resume_events.append("loaded knowledge_curation from conversation_log.json")
+            input_path = write_module_io(
+                raw_dir,
+                "knowledge_curation",
+                "input",
+                {
+                    "topic": research_context,
+                    "ground_truth_url": "None",
+                    "budgets": budgets,
+                    "leakage_phrases": chapter_leakage_phrases(chapter),
+                },
+            )
+            output_path = write_module_io(
+                raw_dir,
+                "knowledge_curation",
+                "output",
+                {
+                    "conversation_log": str(conversation_log_path),
+                    "conversation_log_data": read_json_if_exists(conversation_log_path),
+                    "raw_search_results": str(raw_search_results_path),
+                    "raw_search_results_data": read_json_if_exists(raw_search_results_path),
+                    "resumed_from_existing_artifact": True,
+                },
+            )
+            if not stage_succeeded(checkpoint, "knowledge_curation"):
+                checkpoint = update_checkpoint_stage(
+                    raw_dir,
+                    "knowledge_curation",
+                    {
+                        "status": "success",
+                        "resumed_from_existing_artifact": True,
+                        "runner_stage_name": "run_knowledge_curation_module",
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "outputs": {
+                            "conversation_log": str(conversation_log_path),
+                            "raw_search_results": str(raw_search_results_path),
+                        },
+                    },
+                )
         else:
-            article_outline = StormArticle.from_outline_str(
-                topic=research_context, outline_str=fixed_outline
+            current_stage = "knowledge_curation"
+            input_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "input",
+                {
+                    "topic": research_context,
+                    "ground_truth_url": "None",
+                    "budgets": budgets,
+                    "leakage_phrases": chapter_leakage_phrases(chapter),
+                },
             )
-            article_outline.dump_outline_to_file(str(raw_dir / "storm_gen_outline.txt"))
+            information_table = runner.run_knowledge_curation_module(
+                ground_truth_url="None", callback_handler=BaseCallbackHandler()
+            )
+            history_path = append_lm_call_history(raw_dir, runner, current_stage)
+            metrics = runner_stage_metrics(runner, "run_knowledge_curation_module")
+            search_metrics = rm.budget_log()
+            output_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "output",
+                {
+                    "conversation_log": str(conversation_log_path),
+                    "conversation_log_data": read_json_if_exists(conversation_log_path),
+                    "raw_search_results": str(raw_search_results_path),
+                    "raw_search_results_data": read_json_if_exists(raw_search_results_path),
+                    "search_metrics": search_metrics,
+                    "metrics": metrics,
+                    "llm_call_history": history_path,
+                },
+            )
+            checkpoint = update_checkpoint_stage(
+                raw_dir,
+                current_stage,
+                {
+                    "status": "success",
+                    "runner_stage_name": "run_knowledge_curation_module",
+                    "input_path": input_path,
+                    "output_path": output_path,
+                    "outputs": {
+                        "conversation_log": str(conversation_log_path),
+                        "raw_search_results": str(raw_search_results_path),
+                    },
+                    "metrics": metrics,
+                    "search_metrics": search_metrics,
+                    "llm_call_history": history_path,
+                },
+            )
+
+        article_outline = None
+        outline_path = raw_dir / "storm_gen_outline.txt"
+        direct_outline_path = raw_dir / "direct_gen_outline.txt"
+        outline_reused = False
+        if not args.overwrite and outline_path.exists():
+            candidate_outline = StormArticle.from_outline_file(
+                topic=research_context, file_path=str(outline_path)
+            )
+            candidate_structure = outline_structure_metrics(chapter, candidate_outline)
+            if (
+                candidate_structure["section_count_matches"]
+                and (
+                    stage_succeeded(checkpoint, "outline_validation")
+                    or not checkpoint_stage(checkpoint, "outline_validation")
+                )
+            ):
+                article_outline = candidate_outline
+                outline_reused = True
+                resume_events.append("loaded validated outline from storm_gen_outline.txt")
+                input_path = write_module_io(
+                    raw_dir,
+                    "outline_generation",
+                    "input",
+                    {
+                        "topic": research_context,
+                        "use_storm_outline": use_storm_outline,
+                        "conversation_log": str(conversation_log_path),
+                        "raw_search_results": str(raw_search_results_path),
+                        "fixed_outline": fixed_outline,
+                    },
+                )
+                output_path = write_module_io(
+                    raw_dir,
+                    "outline_generation",
+                    "output",
+                    {
+                        "storm_gen_outline": str(outline_path),
+                        "storm_gen_outline_text": read_text_if_exists(outline_path),
+                        "direct_gen_outline": str(direct_outline_path),
+                        "direct_gen_outline_text": read_text_if_exists(direct_outline_path),
+                        "outline": "\n".join(
+                            article_outline.get_outline_as_list(
+                                add_hashtags=True, include_root=False
+                            )
+                        ),
+                        "first_level_section_names": article_outline.get_first_level_section_names(),
+                        "resumed_from_existing_artifact": True,
+                    },
+                )
+                if not stage_succeeded(checkpoint, "outline_generation"):
+                    checkpoint = update_checkpoint_stage(
+                        raw_dir,
+                        "outline_generation",
+                        {
+                            "status": "success",
+                            "resumed_from_existing_artifact": True,
+                            "runner_stage_name": "run_outline_generation_module",
+                            "input_path": input_path,
+                            "output_path": output_path,
+                            "outputs": {
+                                "storm_gen_outline": str(outline_path),
+                                "direct_gen_outline": str(direct_outline_path),
+                            },
+                        },
+                    )
+                if not stage_succeeded(checkpoint, "outline_validation"):
+                    checkpoint = update_checkpoint_stage(
+                        raw_dir,
+                        "outline_validation",
+                        {
+                            "status": "success",
+                            "outline_structure": candidate_structure,
+                            "outputs": {"storm_gen_outline": str(outline_path)},
+                        },
+                    )
+
+        if article_outline is None:
+            current_stage = "outline_generation"
+            input_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "input",
+                {
+                    "topic": research_context,
+                    "use_storm_outline": use_storm_outline,
+                    "conversation_log": str(conversation_log_path),
+                    "raw_search_results": str(raw_search_results_path),
+                    "fixed_outline": fixed_outline,
+                },
+            )
+            if use_storm_outline:
+                article_outline = runner.run_outline_generation_module(
+                    information_table=information_table,
+                    callback_handler=BaseCallbackHandler(),
+                )
+            else:
+                article_outline = StormArticle.from_outline_str(
+                    topic=research_context, outline_str=fixed_outline
+                )
+                article_outline.dump_outline_to_file(str(outline_path))
+            history_path = append_lm_call_history(raw_dir, runner, current_stage)
+            metrics = runner_stage_metrics(runner, "run_outline_generation_module")
+            output_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "output",
+                {
+                    "storm_gen_outline": str(outline_path),
+                    "storm_gen_outline_text": read_text_if_exists(outline_path),
+                    "direct_gen_outline": str(direct_outline_path),
+                    "direct_gen_outline_text": read_text_if_exists(direct_outline_path),
+                    "outline": "\n".join(
+                        article_outline.get_outline_as_list(
+                            add_hashtags=True, include_root=False
+                        )
+                    ),
+                    "first_level_section_names": article_outline.get_first_level_section_names(),
+                    "metrics": metrics,
+                    "llm_call_history": history_path,
+                },
+            )
+            checkpoint = update_checkpoint_stage(
+                raw_dir,
+                current_stage,
+                {
+                    "status": "success",
+                    "runner_stage_name": "run_outline_generation_module",
+                    "input_path": input_path,
+                    "output_path": output_path,
+                    "outputs": {
+                        "storm_gen_outline": str(outline_path),
+                        "direct_gen_outline": str(direct_outline_path),
+                    },
+                    "metrics": metrics,
+                    "llm_call_history": history_path,
+                },
+            )
+
         outline_for_writer = "\n".join(
             article_outline.get_outline_as_list(add_hashtags=True, include_root=False)
         )
+        current_stage = "outline_validation"
+        outline_structure = outline_structure_metrics(chapter, article_outline)
+        log["outline_structure"] = outline_structure
+        if not outline_structure["section_count_matches"]:
+            output_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "output",
+                {
+                    "outline_structure": outline_structure,
+                    "outline": outline_for_writer,
+                },
+            )
+            checkpoint = update_checkpoint_stage(
+                raw_dir,
+                current_stage,
+                {
+                    "status": "failed",
+                    "output_path": output_path,
+                    "outline_structure": outline_structure,
+                    "outputs": {"storm_gen_outline": str(outline_path)},
+                },
+            )
+            raise RuntimeError(
+                "Generated outline section count does not match dataset structure: "
+                f"expected {outline_structure['expected_section_count']} top-level "
+                f"# sections, got {outline_structure['actual_section_count']} "
+                f"({outline_structure['section_headings']})."
+            )
+        output_path = write_module_io(
+            raw_dir,
+            current_stage,
+            "output",
+            {
+                "outline_structure": outline_structure,
+                "outline": outline_for_writer,
+            },
+        )
+        checkpoint = update_checkpoint_stage(
+            raw_dir,
+            current_stage,
+            {
+                "status": "success",
+                "output_path": output_path,
+                "outline_structure": outline_structure,
+                "outputs": {"storm_gen_outline": str(outline_path)},
+            },
+        )
+
         section_contexts = build_section_contexts(
             chapter,
             outline_for_writer,
             article_outline.get_first_level_section_names() if use_storm_outline else None,
         )
         runner.storm_article_generation.set_section_contexts(section_contexts)
-        draft_article = runner.run_article_generation_module(
-            outline=article_outline,
-            information_table=information_table,
-            callback_handler=BaseCallbackHandler(),
+        article_path = raw_dir / "storm_gen_article.txt"
+        url_to_info_path = raw_dir / "url_to_info.json"
+        draft_article = None
+        article_cache_usable = (
+            not args.overwrite
+            and outline_reused
+            and not previous_article_invalid
+            and not stage_invalidated(checkpoint, "article_generation")
+            and article_path.exists()
+            and url_to_info_path.exists()
+            and (
+                stage_succeeded(checkpoint, "article_generation")
+                or not checkpoint_stage(checkpoint, "article_generation")
+            )
         )
+        if article_cache_usable:
+            draft_article = runner._load_draft_article_from_local_fs(
+                topic=research_context,
+                draft_article_path=str(article_path),
+                url_to_info_path=str(url_to_info_path),
+            )
+            resume_events.append("loaded article_generation from storm_gen_article.txt")
+            input_path = write_module_io(
+                raw_dir,
+                "article_generation",
+                "input",
+                {
+                    "writer_topic": writer_topic,
+                    "outline_for_writer": outline_for_writer,
+                    "first_level_section_names": article_outline.get_first_level_section_names(),
+                    "section_contexts": section_contexts,
+                    "conversation_log": str(conversation_log_path),
+                    "raw_search_results": str(raw_search_results_path),
+                },
+            )
+            output_path = write_module_io(
+                raw_dir,
+                "article_generation",
+                "output",
+                {
+                    "storm_gen_article": str(article_path),
+                    "storm_gen_article_text": read_text_if_exists(article_path),
+                    "url_to_info": str(url_to_info_path),
+                    "url_to_info_data": read_json_if_exists(url_to_info_path),
+                    "resumed_from_existing_artifact": True,
+                },
+            )
+            if not stage_succeeded(checkpoint, "article_generation"):
+                checkpoint = update_checkpoint_stage(
+                    raw_dir,
+                    "article_generation",
+                    {
+                        "status": "success",
+                        "resumed_from_existing_artifact": True,
+                        "runner_stage_name": "run_article_generation_module",
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "outputs": {
+                            "storm_gen_article": str(article_path),
+                            "url_to_info": str(url_to_info_path),
+                        },
+                    },
+                )
+        else:
+            current_stage = "article_generation"
+            input_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "input",
+                {
+                    "writer_topic": writer_topic,
+                    "outline_for_writer": outline_for_writer,
+                    "first_level_section_names": article_outline.get_first_level_section_names(),
+                    "section_contexts": section_contexts,
+                    "conversation_log": str(conversation_log_path),
+                    "raw_search_results": str(raw_search_results_path),
+                },
+            )
+            draft_article = runner.run_article_generation_module(
+                outline=article_outline,
+                information_table=information_table,
+                callback_handler=BaseCallbackHandler(),
+            )
+            history_path = append_lm_call_history(raw_dir, runner, current_stage)
+            metrics = runner_stage_metrics(runner, "run_article_generation_module")
+            output_path = write_module_io(
+                raw_dir,
+                current_stage,
+                "output",
+                {
+                    "storm_gen_article": str(article_path),
+                    "storm_gen_article_text": read_text_if_exists(article_path),
+                    "url_to_info": str(url_to_info_path),
+                    "url_to_info_data": read_json_if_exists(url_to_info_path),
+                    "metrics": metrics,
+                    "llm_call_history": history_path,
+                },
+            )
+            checkpoint = update_checkpoint_stage(
+                raw_dir,
+                current_stage,
+                {
+                    "status": "success",
+                    "runner_stage_name": "run_article_generation_module",
+                    "input_path": input_path,
+                    "output_path": output_path,
+                    "outputs": {
+                        "storm_gen_article": str(article_path),
+                        "url_to_info": str(url_to_info_path),
+                    },
+                    "metrics": metrics,
+                    "llm_call_history": history_path,
+                },
+            )
+
         final_article = draft_article
         if args.do_polish_article:
-            final_article = runner.run_article_polishing_module(
-                draft_article=draft_article,
-                remove_duplicate=False,
+            polished_path = raw_dir / "storm_gen_article_polished.txt"
+            polish_cache_usable = (
+                not args.overwrite
+                and article_cache_usable
+                and polished_path.exists()
+                and stage_succeeded(checkpoint, "article_polishing")
             )
-        runner.post_run()
+            if polish_cache_usable:
+                polished_text = polished_path.read_text(encoding="utf-8")
+                final_article = StormArticle.from_string(
+                    topic_name=research_context,
+                    article_text=polished_text,
+                    references=read_json(url_to_info_path),
+                )
+                resume_events.append("loaded article_polishing from storm_gen_article_polished.txt")
+                input_path = write_module_io(
+                    raw_dir,
+                    "article_polishing",
+                    "input",
+                    {
+                        "draft_article": str(article_path),
+                        "remove_duplicate": False,
+                    },
+                )
+                output_path = write_module_io(
+                    raw_dir,
+                    "article_polishing",
+                    "output",
+                    {
+                        "storm_gen_article_polished": str(polished_path),
+                        "storm_gen_article_polished_text": polished_text,
+                        "resumed_from_existing_artifact": True,
+                    },
+                )
+                checkpoint = update_checkpoint_stage(
+                    raw_dir,
+                    "article_polishing",
+                    {
+                        "status": "success",
+                        "resumed_from_existing_artifact": True,
+                        "runner_stage_name": "run_article_polishing_module",
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "outputs": {"storm_gen_article_polished": str(polished_path)},
+                    },
+                )
+            else:
+                current_stage = "article_polishing"
+                input_path = write_module_io(
+                    raw_dir,
+                    current_stage,
+                    "input",
+                    {
+                        "draft_article": str(article_path),
+                        "remove_duplicate": False,
+                    },
+                )
+                final_article = runner.run_article_polishing_module(
+                    draft_article=draft_article,
+                    remove_duplicate=False,
+                )
+                history_path = append_lm_call_history(raw_dir, runner, current_stage)
+                metrics = runner_stage_metrics(runner, "run_article_polishing_module")
+                output_path = write_module_io(
+                    raw_dir,
+                    current_stage,
+                    "output",
+                    {
+                        "storm_gen_article_polished": str(polished_path),
+                        "storm_gen_article_polished_text": read_text_if_exists(polished_path),
+                        "metrics": metrics,
+                        "llm_call_history": history_path,
+                    },
+                )
+                checkpoint = update_checkpoint_stage(
+                    raw_dir,
+                    current_stage,
+                    {
+                        "status": "success",
+                        "runner_stage_name": "run_article_polishing_module",
+                        "input_path": input_path,
+                        "output_path": output_path,
+                        "outputs": {"storm_gen_article_polished": str(polished_path)},
+                        "metrics": metrics,
+                        "llm_call_history": history_path,
+                    },
+                )
+        write_run_config(raw_dir, runner)
 
+        current_stage = "final_export"
+        input_path = write_module_io(
+            raw_dir,
+            current_stage,
+            "input",
+            {
+                "chapter_title": chapter.get("chapter_title", chapter_id),
+                "raw_article": final_article.to_string(),
+                "do_polish_article": args.do_polish_article,
+            },
+        )
         markdown_with_citations = format_textbook_markdown(
             chapter_title=chapter.get("chapter_title", chapter_id),
             raw_article=final_article.to_string(),
@@ -942,9 +1655,46 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 f"({structure_metrics['section_headings']})."
             )
         md_path.write_text(markdown, encoding="utf-8")
+        output_path = write_module_io(
+            raw_dir,
+            current_stage,
+            "output",
+            {
+                "markdown": str(md_path),
+                "markdown_text": markdown,
+                "markdown_with_citations": str(raw_dir / "chapter_with_citations.md"),
+                "markdown_with_citations_text": markdown_with_citations,
+                "actual_word_count": actual_word_count,
+                "max_heading_depth": structure_metrics["max_heading_depth"],
+                "structure": structure_metrics,
+                "removed_numeric_citation_markers": citation_count_removed,
+            },
+        )
+        checkpoint = update_checkpoint_stage(
+            raw_dir,
+            current_stage,
+            {
+                "status": "success",
+                "input_path": input_path,
+                "output_path": output_path,
+                "outputs": {
+                    "markdown": str(md_path),
+                    "markdown_with_citations": str(raw_dir / "chapter_with_citations.md"),
+                },
+                "actual_word_count": actual_word_count,
+                "structure": structure_metrics,
+            },
+        )
 
         elapsed = time.time() - start_time
-        search_metrics = rm.budget_log()
+        checkpoint = load_checkpoint(raw_dir)
+        stage_runtime_seconds, token_usage, retriever_usage = merge_cached_stage_metrics(
+            checkpoint, runner
+        )
+        search_metrics = (
+            checkpoint_stage(checkpoint, "knowledge_curation").get("search_metrics")
+            or rm.budget_log()
+        )
         warnings = []
         if search_metrics["accepted_source_count"] == 0:
             warnings.append(
@@ -957,9 +1707,10 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 "actual_word_count": actual_word_count,
                 "max_heading_depth": structure_metrics["max_heading_depth"],
                 "structure": structure_metrics,
-                "stage_runtime_seconds": runner.time,
-                "token_usage": runner.lm_cost,
-                "retriever_usage": runner.rm_cost,
+                "outline_structure": outline_structure,
+                "stage_runtime_seconds": stage_runtime_seconds,
+                "token_usage": token_usage,
+                "retriever_usage": retriever_usage,
                 "search_metrics": search_metrics,
                 "section_context_count": len(section_contexts),
                 "polishing": {
@@ -976,16 +1727,52 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
             }
         )
     except Exception as exc:
+        if runner is not None and current_stage:
+            history_path = append_lm_call_history(raw_dir, runner, current_stage)
+        else:
+            history_path = str(raw_dir / "llm_call_history.jsonl")
+        failure_payload = {
+            "status": "failed",
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "llm_call_history": history_path,
+        }
+        if current_stage:
+            if rm is not None and current_stage == "knowledge_curation":
+                failure_payload["search_metrics"] = rm.budget_log()
+            update_checkpoint_stage(raw_dir, current_stage, failure_payload)
+            if current_stage == "final_export" and final_export_invalidates_article(str(exc)):
+                checkpoint = invalidate_checkpoint_stage(
+                    raw_dir,
+                    "article_generation",
+                    f"Invalid final export output: {exc}",
+                )
+                resume_events.append(
+                    "invalidated article_generation after final_export validation failure"
+                )
+        if runner is not None:
+            write_run_config(raw_dir, runner)
         elapsed = time.time() - start_time
+        checkpoint = load_checkpoint(raw_dir)
+        stage_runtime_seconds, token_usage, retriever_usage = (
+            merge_cached_stage_metrics(checkpoint, runner)
+            if runner is not None
+            else ({}, {}, {})
+        )
         log.update(
             {
                 "status": "failed",
                 "elapsed_seconds": elapsed,
                 "error": str(exc),
                 "traceback": traceback.format_exc(),
+                "failed_stage": current_stage,
+                "stage_runtime_seconds": stage_runtime_seconds,
+                "token_usage": token_usage,
+                "retriever_usage": retriever_usage,
             }
         )
 
+    log["resume_events"] = resume_events
     write_json(log_path, {k: v for k, v in log.items() if k != "markdown"})
     return log
 

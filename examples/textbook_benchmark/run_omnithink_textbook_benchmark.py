@@ -45,6 +45,7 @@ from examples.storm_examples.run_storm_textbook_benchmark import (
     count_words,
     format_knowledge_units,
     format_objectives,
+    format_section_knowledge_units,
     format_textbook_markdown,
     length_budget,
     load_env_file,
@@ -190,6 +191,11 @@ def chapter_requirement_markdown(chapter: dict) -> str:
         if objectives:
             lines.append("Learning objectives:")
             lines.extend(f"- {objective}" for objective in objectives)
+        section_units = format_section_knowledge_units(section)
+        if section_units:
+            lines.append("Knowledge units:")
+            lines.extend(f"- {unit}" for unit in section_units)
+            continue
         for group_index, subsection in enumerate(ordered_subsections(section), start=1):
             subsection_heading = clean_heading(subsection.get("heading")) or (
                 f"Knowledge group {group_index}"
@@ -212,6 +218,14 @@ def build_mindmap_queries(chapter: dict, max_queries: int) -> List[str]:
                 queries.append(query)
             if len(queries) >= max_queries:
                 return queries
+        section_units = format_section_knowledge_units(section)
+        if section_units:
+            query = compact_text(f"{title} {' '.join(section_units[:2])}", 160)
+            if query and query not in queries:
+                queries.append(query)
+            if len(queries) >= max_queries:
+                return queries
+            continue
         for subsection in ordered_subsections(section):
             units = format_knowledge_units(subsection)
             if not units:
@@ -350,6 +364,7 @@ class TextbookMindMap:
         concepts = []
         for section in ordered_sections(self.chapter):
             concepts.extend(format_objectives(section))
+            concepts.extend(format_section_knowledge_units(section)[:2])
             for subsection in ordered_subsections(section):
                 concepts.extend(format_knowledge_units(subsection)[:2])
         concepts = [compact_text(concept, 180) for concept in concepts if concept]
@@ -654,10 +669,13 @@ def synthetic_section_heading(section: dict, index: int) -> str:
     if objectives:
         candidate = objectives[0]
     else:
+        units = format_section_knowledge_units(section)
+        if units:
+            candidate = units[0]
         for subsection in ordered_subsections(section):
-            units = format_knowledge_units(subsection)
-            if units:
-                candidate = units[0]
+            subsection_units = format_knowledge_units(subsection)
+            if subsection_units and not candidate:
+                candidate = subsection_units[0]
                 break
     suffix = compact_text(candidate, 70) if candidate else ""
     return f"Section {index}: {suffix}" if suffix else f"Section {index}"

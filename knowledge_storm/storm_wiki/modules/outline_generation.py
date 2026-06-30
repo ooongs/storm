@@ -131,6 +131,8 @@ class WritePageOutline(dspy.Signature):
     1. Use "#" Title" to indicate section title, "##" Title" to indicate subsection title, "###" Title" to indicate subsubsection title, and so on.
     2. Do not include other information.
     3. Do not include topic name itself in the outline.
+    4. If the topic includes outline constraints, obey them exactly, especially the required number and order of top-level "#" section headings.
+    5. If the topic lists Input sections, create exactly one top-level "#" heading per Input section and do not add extra top-level headings.
     """
 
     topic = dspy.InputField(prefix="The textbook chapter you want to write: ", format=str)
@@ -156,6 +158,8 @@ class WritePageOutlineFromConv(dspy.Signature):
     1. Use "#" Title" to indicate section title, "##" Title" to indicate subsection title, "###" Title" to indicate subsubsection title, and so on.
     2. Do not include other information.
     3. Do not include topic name itself in the outline.
+    4. If the topic includes outline constraints, obey them exactly, especially the required number and order of top-level "#" section headings.
+    5. If the topic lists Input sections, preserve exactly one top-level "#" heading per Input section and do not add, remove, merge, or split top-level sections.
     """
 
     topic = dspy.InputField(prefix="The topic you want to write: ", format=str)
