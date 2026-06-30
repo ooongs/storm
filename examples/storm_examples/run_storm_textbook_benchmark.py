@@ -904,7 +904,7 @@ def create_lm_configs(args) -> STORMWikiLMConfigs:
     lm_configs = STORMWikiLMConfigs()
     lm_configs.set_conv_simulator_lm(weak_lm)
     lm_configs.set_question_asker_lm(weak_lm)
-    lm_configs.set_outline_gen_lm(weak_lm)
+    lm_configs.set_outline_gen_lm(article_lm)
     lm_configs.set_article_gen_lm(article_lm)
     lm_configs.set_article_polish_lm(weak_lm)
     return lm_configs
@@ -1048,6 +1048,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
     writer_topic = build_writer_topic(chapter)
     section_contexts = {}
     weak_model, strong_model = resolve_model_pair(args)
+    outline_model = strong_model
     checkpoint = load_checkpoint(raw_dir)
     resume_events = []
 
@@ -1064,7 +1065,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
             "article_generation": strong_model,
             "knowledge_curation": weak_model,
             "question_asking": weak_model,
-            "outline_generation": weak_model,
+            "outline_generation": outline_model,
             "article_polishing": weak_model,
         },
         "outline_source": "storm_generated" if use_storm_outline else "benchmark_fixed",
@@ -1217,8 +1218,17 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 topic=research_context, file_path=str(outline_path)
             )
             candidate_structure = outline_structure_metrics(chapter, candidate_outline)
+            outline_stage = checkpoint_stage(checkpoint, "outline_generation")
+            outline_cache_matches_model = (
+                not use_storm_outline
+                or (
+                    stage_succeeded(checkpoint, "outline_generation")
+                    and outline_stage.get("model") == outline_model
+                )
+            )
             if (
                 candidate_structure["section_count_matches"]
+                and outline_cache_matches_model
                 and (
                     stage_succeeded(checkpoint, "outline_validation")
                     or not checkpoint_stage(checkpoint, "outline_validation")
@@ -1237,6 +1247,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                         "conversation_log": str(conversation_log_path),
                         "raw_search_results": str(raw_search_results_path),
                         "fixed_outline": fixed_outline,
+                        "model": outline_model if use_storm_outline else None,
                     },
                 )
                 output_path = write_module_io(
@@ -1254,6 +1265,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                             )
                         ),
                         "first_level_section_names": article_outline.get_first_level_section_names(),
+                        "model": outline_model if use_storm_outline else None,
                         "resumed_from_existing_artifact": True,
                     },
                 )
@@ -1265,6 +1277,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                             "status": "success",
                             "resumed_from_existing_artifact": True,
                             "runner_stage_name": "run_outline_generation_module",
+                            "model": outline_model if use_storm_outline else None,
                             "input_path": input_path,
                             "output_path": output_path,
                             "outputs": {
@@ -1296,6 +1309,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                     "conversation_log": str(conversation_log_path),
                     "raw_search_results": str(raw_search_results_path),
                     "fixed_outline": fixed_outline,
+                    "model": outline_model if use_storm_outline else None,
                 },
             )
             if use_storm_outline:
@@ -1325,6 +1339,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                         )
                     ),
                     "first_level_section_names": article_outline.get_first_level_section_names(),
+                    "model": outline_model if use_storm_outline else None,
                     "metrics": metrics,
                     "llm_call_history": history_path,
                 },
@@ -1335,6 +1350,7 @@ def run_chapter(chapter: dict, args, output_dir: Path) -> dict:
                 {
                     "status": "success",
                     "runner_stage_name": "run_outline_generation_module",
+                    "model": outline_model if use_storm_outline else None,
                     "input_path": input_path,
                     "output_path": output_path,
                     "outputs": {
@@ -1783,6 +1799,7 @@ def dry_run_chapter(chapter: dict, args) -> dict:
     budgets = compute_budgets(chapter)
     section_contexts = {} if use_storm_outline else build_section_contexts(chapter, outline)
     weak_model, strong_model = resolve_model_pair(args)
+    outline_model = strong_model
     return {
         "chapter_id": chapter["chapter_id"],
         "dataset_id": chapter.get("dataset_id"),
@@ -1796,7 +1813,7 @@ def dry_run_chapter(chapter: dict, args) -> dict:
             "article_generation": strong_model,
             "knowledge_curation": weak_model,
             "question_asking": weak_model,
-            "outline_generation": weak_model,
+            "outline_generation": outline_model,
             "article_polishing": weak_model,
         },
         "outline_source": "storm_generated" if use_storm_outline else "benchmark_fixed",
