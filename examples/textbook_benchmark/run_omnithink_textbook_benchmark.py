@@ -40,6 +40,7 @@ from knowledge_storm.storm_wiki.modules.outline_generation import (
 from examples.storm_examples.run_storm_textbook_benchmark import (
     QWEN_DEFAULT_API_BASE,
     attach_output_keys,
+    build_research_context,
     build_section_contexts,
     chapter_leakage_phrases,
     chapter_needs_generated_headings,
@@ -231,8 +232,14 @@ def chapter_requirement_markdown(chapter: dict) -> str:
     return "\n".join(lines)
 
 
-def outline_generation_topic(chapter: dict) -> str:
-    return chapter_requirement_markdown(chapter)
+def outline_generation_topic(chapter: dict, args) -> str:
+    return build_research_context(
+        chapter,
+        {
+            "query_budget": args.max_search_queries,
+            "source_budget": args.max_sources,
+        },
+    )
 
 
 def build_mindmap_queries(chapter: dict, max_queries: int) -> List[str]:
@@ -884,7 +891,7 @@ def resolve_outline(
         }
 
     outline_module = StormWriteOutline(outline_lm)
-    outline_topic = outline_generation_topic(chapter)
+    outline_topic = outline_generation_topic(chapter, args)
     outline_result = outline_module(
         topic=outline_topic,
         dlg_history=build_storm_outline_dialogue(chapter, mindmap),
@@ -1331,7 +1338,7 @@ def run_task(chapter: dict, baseline: str, args, output_dir: Path, omni: dict) -
                         "model": args.model,
                         "mindmap": str(mindmap_path),
                         "requirements": str(requirements_path),
-                        "outline_topic": outline_generation_topic(chapter),
+                        "outline_topic": outline_generation_topic(chapter, args),
                     },
                 )
                 output_path = write_module_io(
@@ -1370,7 +1377,7 @@ def run_task(chapter: dict, baseline: str, args, output_dir: Path, omni: dict) -
                     "model": args.model,
                     "mindmap": str(mindmap_path),
                     "requirements": str(requirements_path),
-                    "outline_topic": outline_generation_topic(chapter),
+                    "outline_topic": outline_generation_topic(chapter, args),
                     "mindmap_summary": mindmap.export_categories_and_concepts(),
                 },
             )
