@@ -190,6 +190,7 @@ def simple_tokens(text: str) -> set:
 
 def chapter_requirement_markdown(chapter: dict) -> str:
     length = length_budget(chapter)
+    section_count = len(ordered_sections(chapter))
     lines = [
         f"Book title: {chapter.get('book_title') or chapter.get('metadata', {}).get('book_title', '')}",
         f"Chapter number: {chapter.get('chapter_number', '')}",
@@ -197,11 +198,20 @@ def chapter_requirement_markdown(chapter: dict) -> str:
         f"Target words: {length['target_words']}",
         f"Allowed word range: {length['word_range']}",
         "",
-        "Benchmark outline requirements:",
+        "Outline constraints:",
+        f"- Create exactly {section_count} top-level outline section(s) using single-# headings.",
+        "- Create exactly one top-level # heading for each Input section below, in the same order.",
+        "- Infer concise textbook section titles from each Input section's learning objectives and knowledge units.",
+        "- Do not use the chapter title, book title, metadata labels, or target word budget as outline headings.",
+        "- Do not add extra top-level # headings for learning objectives, introduction, conclusion, summary, exercises, references, or sources unless they correspond to an Input section.",
+        "- Use ## or ### only for lower-level structure inside those required top-level sections.",
+        "- Output only the markdown outline; do not add explanatory prose before or after it.",
+        "",
+        "Input sections:",
     ]
     for section_index, section in enumerate(ordered_sections(chapter), start=1):
         section_heading = clean_heading(section.get("heading")) or f"Section {section_index}"
-        lines.append(f"\n{section_heading}")
+        lines.append(f"\nInput section {section_index}: {section_heading}")
         objectives = format_objectives(section)
         if objectives:
             lines.append("Learning objectives:")
@@ -219,6 +229,10 @@ def chapter_requirement_markdown(chapter: dict) -> str:
             lines.append(f"{subsection_heading}:")
             lines.extend(f"- {unit}" for unit in units or ["No explicit knowledge units."])
     return "\n".join(lines)
+
+
+def outline_generation_topic(chapter: dict) -> str:
+    return chapter_requirement_markdown(chapter)
 
 
 def build_mindmap_queries(chapter: dict, max_queries: int) -> List[str]:
@@ -870,8 +884,9 @@ def resolve_outline(
         }
 
     outline_module = StormWriteOutline(outline_lm)
+    outline_topic = outline_generation_topic(chapter)
     outline_result = outline_module(
-        topic=clean_heading(chapter.get("chapter_title", "Untitled Chapter")),
+        topic=outline_topic,
         dlg_history=build_storm_outline_dialogue(chapter, mindmap),
     )
     raw_outline = outline_result.outline
@@ -898,6 +913,7 @@ def resolve_outline(
         "mode": "omnithink",
         "source": "omnithink_generated_outline",
         "prompt_source": "knowledge_storm.storm_wiki.modules.outline_generation.WriteOutline",
+        "outline_topic": outline_topic,
         "raw_outline_path": str(raw_dir / "omnithink_raw_outline.md"),
         "draft_outline_path": str(raw_dir / "storm_aligned_draft_outline.md"),
         "outline_path": str(raw_dir / "textbook_outline.md"),
@@ -1315,6 +1331,7 @@ def run_task(chapter: dict, baseline: str, args, output_dir: Path, omni: dict) -
                         "model": args.model,
                         "mindmap": str(mindmap_path),
                         "requirements": str(requirements_path),
+                        "outline_topic": outline_generation_topic(chapter),
                     },
                 )
                 output_path = write_module_io(
@@ -1353,6 +1370,7 @@ def run_task(chapter: dict, baseline: str, args, output_dir: Path, omni: dict) -
                     "model": args.model,
                     "mindmap": str(mindmap_path),
                     "requirements": str(requirements_path),
+                    "outline_topic": outline_generation_topic(chapter),
                     "mindmap_summary": mindmap.export_categories_and_concepts(),
                 },
             )
@@ -1824,6 +1842,19 @@ def progress_write(args, message: str) -> None:
         print(message, flush=True)
 
 
+def task_progress_message(index: int, total: int, baseline: str, output_id: str, result: dict) -> str:
+    message = f"[{index}/{total}] done {baseline}/{output_id}: {result.get('status')}"
+    if result.get("status") == "failed":
+        details = []
+        if result.get("failed_stage"):
+            details.append(f"stage={result.get('failed_stage')}")
+        if result.get("error"):
+            details.append(f"error={compact_text(result.get('error'), 240)}")
+        if details:
+            message = f"{message} ({'; '.join(details)})"
+    return message
+
+
 def run_tasks(chapters: List[dict], baselines: List[str], args, omni: Optional[dict]) -> List[dict]:
     tasks = [(chapter, baseline) for chapter in chapters for baseline in baselines]
     ordered_results: List[Optional[dict]] = [None] * len(tasks)
@@ -1842,7 +1873,7 @@ def run_tasks(chapters: List[dict], baselines: List[str], args, omni: Optional[d
             ordered_results[index - 1] = result
             progress_write(
                 args,
-                f"[{index}/{len(tasks)}] done {baseline}/{output_id}: {result.get('status')}",
+                task_progress_message(index, len(tasks), baseline, output_id, result),
             )
             save_progress(args.output_dir, ordered_results)
             if result.get("status") == "failed" and args.stop_on_error:
@@ -1878,7 +1909,13 @@ def run_tasks(chapters: List[dict], baselines: List[str], args, omni: Optional[d
             ordered_results[index] = result
             progress_write(
                 args,
-                f"[{completed}/{len(tasks)}] done {baseline}/{chapter_output_id(chapter)}: {result.get('status')}",
+                task_progress_message(
+                    completed,
+                    len(tasks),
+                    baseline,
+                    chapter_output_id(chapter),
+                    result,
+                ),
             )
             save_progress(args.output_dir, ordered_results)
             if result.get("status") == "failed" and args.stop_on_error:
