@@ -8,6 +8,7 @@ section generation over a lightweight textbook mind-map facade.
 
 import argparse
 import copy
+import importlib.util
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import shutil
 import sys
 import time
 import traceback
+import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -602,6 +604,38 @@ class TextbookArticleGenerationModule:
         return article
 
 
+def _ensure_omnithink_package_aliases(src_dir: Path) -> None:
+    for package_name, package_dir in {
+        "src": src_dir,
+        "src.actions": src_dir / "actions",
+        "src.dataclass": src_dir / "dataclass",
+        "src.utils": src_dir / "utils",
+    }.items():
+        module = sys.modules.get(package_name)
+        if module is None:
+            module = types.ModuleType(package_name)
+            module.__path__ = [str(package_dir)]
+            module.__package__ = package_name
+            sys.modules[package_name] = module
+        elif not hasattr(module, "__path__"):
+            module.__path__ = [str(package_dir)]
+
+
+def _load_omnithink_module(module_name: str, path: Path):
+    module = sys.modules.get(module_name)
+    if module is not None:
+        return module
+
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load OmniThink module {module_name} from {path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def load_omnithink(omnithink_dir: Path) -> dict:
     omnithink_dir = omnithink_dir.resolve()
     if not omnithink_dir.exists():
@@ -614,14 +648,34 @@ def load_omnithink(omnithink_dir: Path) -> dict:
     if str(omnithink_dir) not in sys.path:
         sys.path.insert(0, str(omnithink_dir))
 
-    from src.actions.article_polish import ArticlePolishingModule
-    from src.dataclass.Article import Article
-    from src.utils.ArticleTextProcessing import ArticleTextProcessing
+    src_dir = omnithink_dir / "src"
+    _ensure_omnithink_package_aliases(src_dir)
+
+    text_processing_module = _load_omnithink_module(
+        "src.utils.ArticleTextProcessing",
+        src_dir / "utils" / "ArticleTextProcessing.py",
+    )
+    _load_omnithink_module(
+        "src.utils.FileIOHelper",
+        src_dir / "utils" / "FileIOHelper.py",
+    )
+    _load_omnithink_module(
+        "src.dataclass.interface",
+        src_dir / "dataclass" / "interface.py",
+    )
+    article_module = _load_omnithink_module(
+        "src.dataclass.Article",
+        src_dir / "dataclass" / "Article.py",
+    )
+    polish_module = _load_omnithink_module(
+        "src.actions.article_polish",
+        src_dir / "actions" / "article_polish.py",
+    )
 
     return {
-        "Article": Article,
-        "ArticlePolishingModule": ArticlePolishingModule,
-        "ArticleTextProcessing": ArticleTextProcessing,
+        "Article": article_module.Article,
+        "ArticlePolishingModule": polish_module.ArticlePolishingModule,
+        "ArticleTextProcessing": text_processing_module.ArticleTextProcessing,
     }
 
 
